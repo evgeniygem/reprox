@@ -1,0 +1,39 @@
+[Unit]
+Description=reprox (SNI routing for telemt / FakeTLS)
+After=network-online.target
+Wants=network-online.target
+# If telemt is also managed by systemd, this service starts after it.
+After=telemt.service
+
+[Service]
+Type=simple
+User=reprox
+Group=reprox
+WorkingDirectory=/etc/reprox
+Environment=REPROX_CONFIG=/etc/reprox/config.toml
+Environment=RUST_LOG=info
+ExecStart=/usr/local/bin/reprox
+Restart=on-failure
+RestartSec=2
+
+# Port 443 without root: use a Linux capability instead of running as root.
+# Before starting the service, run this once:
+#   sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/reprox
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+# Basic systemd sandboxing hardening.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadOnlyPaths=/etc/reprox
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+[package]
+name = "reprox"
+version = "0.1.0"
+edition = "2024"
+description = "SNI-routing front for telemt (MTProto/FakeTLS): proxies the secret SNI to telemt, serves everything else as an ordinary HTTPS site."
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+
+# TLS
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+rustls-pemfile = "2"
+
+# HTTP (fallback site)# HTTP (fallback site)
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+http = "1"
+bytes = "1"
+
+# Configuration
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+httpdate = "1.0"
+percent-encoding = "2"
+async-recursion = "1.1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
