@@ -3,6 +3,7 @@ name = "reprox"
 version = "0.1.0"
 edition = "2024"
 description = "SNI-routing front for telemt (MTProto/FakeTLS): proxies the secret SNI to telemt, serves everything else as an ordinary HTTPS site."
+license = "MIT"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
