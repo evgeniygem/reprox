@@ -52,12 +52,20 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Rename artifact
+      - name: Package artifact
         id: artifact
         run: |
           ARTIFACT_NAME="${BIN_NAME}-${{ matrix.target }}"
-          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${ARTIFACT_NAME}"
-          echo "name=${ARTIFACT_NAME}" >> "$GITHUB_OUTPUT"
+          PKG_DIR="$(mktemp -d)/${ARTIFACT_NAME}"
+          mkdir -p "${PKG_DIR}"
+
+          cp "target/${{ matrix.target }}/release/${BIN_NAME}" "${PKG_DIR}/"
+          for extra in README.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+            [ -f "${extra}" ] && cp "${extra}" "${PKG_DIR}/"
+          done
+
+          tar -czf "${ARTIFACT_NAME}.tar.gz" -C "$(dirname "${PKG_DIR}")" "${ARTIFACT_NAME}"
+          echo "name=${ARTIFACT_NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
