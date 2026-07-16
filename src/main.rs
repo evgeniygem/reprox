@@ -26,7 +26,7 @@ async fn main() -> anyhow::Result<()> {
     // Required step for rustls 0.23+: install the process-wide default
     // crypto provider (we use ring — the same provider explicitly used
     // below when building the ServerConfig).
-    rustls::crypto::ring::default_provider()
+    rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|_| anyhow::anyhow!("failed to install the rustls crypto provider"))?;
 

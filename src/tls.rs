@@ -10,6 +10,7 @@
 use anyhow::Context;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::{ServerConfig, version};
+use rustls_pki_types::pem::PemObject;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::fs;
@@ -20,7 +21,7 @@ pub async fn build_server_config(config: &ServiceConfig) -> anyhow::Result<Serve
     let certs = load_certs(&config.tls_cert_path).await?;
     let key = load_key(&config.tls_key_path).await?;
 
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
     let versions: &[&'static rustls::SupportedProtocolVersion] = if config.tls_min_version == "1.3"
     {
@@ -49,7 +50,7 @@ async fn load_certs(path: &Path) -> anyhow::Result<Vec<CertificateDer<'static>>>
         .with_context(|| format!("failed to open certificate file {path:?}"))?;
 
     let mut reader = buffer.as_slice();
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_reader_iter(&mut reader)
         .collect::<Result<Vec<_>, _>>()
         .with_context(|| format!("failed to parse PEM certificates from {path:?}"))?;
     if certs.is_empty() {
@@ -64,7 +65,6 @@ async fn load_key(path: &Path) -> anyhow::Result<PrivateKeyDer<'static>> {
         .with_context(|| format!("failed to open key file {path:?}"))?;
 
     let mut reader = buffer.as_slice();
-    rustls_pemfile::private_key(&mut reader)
-        .with_context(|| format!("failed to parse private key from {path:?}"))?
-        .ok_or_else(|| anyhow::anyhow!("no private key (PKCS#8/RSA/SEC1) found in {path:?}"))
+    PrivateKeyDer::from_pem_reader(&mut reader)
+        .with_context(|| format!("failed to parse private key from {path:?}"))
 }

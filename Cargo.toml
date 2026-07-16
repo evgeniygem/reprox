@@ -9,9 +9,9 @@ license = "MIT"
 tokio = { version = "1", features = ["full"] }
 
 # TLS
-rustls = { version = "0.23", features = ["ring"] }
+rustls = "0.23"
 tokio-rustls = "0.26"
-rustls-pemfile = "2"
+rustls-pki-types = "1.15"
 
 # HTTP (fallback site)# HTTP (fallback site)
 hyper = { version = "1", features = ["full"] }
