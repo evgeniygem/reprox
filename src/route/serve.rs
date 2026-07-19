@@ -26,7 +26,8 @@ use crate::metrics::Stats;
 use crate::prefixed_stream::PrefixedStream;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
+use tokio::time::timeout;
 
 // TLS termination + choosing HTTP/1.1 or HTTP/2 based on the ALPN result
 pub async fn serve(
@@ -38,15 +39,16 @@ pub async fn serve(
     stats: Arc<Stats>,
 ) -> anyhow::Result<()> {
     let io = PrefixedStream::new(prefix, stream);
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
-    let tls_stream = match acceptor.accept(io).await {
-        Ok(s) => {
+    let tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
+        Ok(Ok(s)) => {
             stats
                 .tls_handshake_success_total
                 .fetch_add(1, Ordering::Relaxed);
             s
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             // Invalid ClientHello, unsupported TLS version, etc. rustls
             // itself sends a proper TLS alert wherever the protocol calls
             // for one; after the error we just close the connection —
@@ -56,6 +58,15 @@ pub async fn serve(
                 .tls_handshake_failure_total
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(error = %e, "fallback-path TLS handshake failed");
+            return Ok(());
+        }
+        Err(_) => {
+            // Slowloris-style stall: the client never finished the TLS
+            // handshake within handshake_timeout_secs.
+            stats
+                .tls_handshake_failure_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("fallback-path TLS handshake timed out");
             return Ok(());
         }
     };
