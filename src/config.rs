@@ -123,8 +123,10 @@ impl ServiceConfig {
         if let Ok(v) = std::env::var("REPROX_TLS_MIN_VERSION") {
             self.tls_min_version = v;
         }
-        if let Ok(v) = std::env::var("REPROX_METRICS_ADDR") {
-            self.metrics_addr = v.parse().ok();
+        if let Ok(v) = std::env::var("REPROX_METRICS_ADDR")
+            && let Ok(addr) = v.parse()
+        {
+            self.metrics_addr = Some(addr);
         }
     }
 
