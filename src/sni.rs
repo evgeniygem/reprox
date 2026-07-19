@@ -7,13 +7,14 @@
 //! Handshake::ClientHello inside it, and extract the `server_name`
 //! extension (RFC 6066). The buffer of already-read bytes is returned to
 //! the caller so it can be replayed further down the line — either into
-//! the proxy connection to telemt, or into rustls (via `PrefixedStream`)
+//! the proxy connection to service, or into rustls (via `PrefixedStream`)
 //! — without losing a single byte of the original stream.
 //!
-//! Parsing is resilient to garbage data: any format error or missing
-//! SNI is treated as `None`, which by main.rs's logic routes the
-//! connection to the fallback path, where a full TLS stack (rustls)
-//! correctly terminates a malformed handshake with a TLS alert on its own.
+//! The result is classified into a `ProbeResult`, which both drives
+//! main.rs's routing decision and doubles as a metrics label (see
+//! metrics.rs's `clienthello_*_total` counters) — operationally it's
+//! useful to be able to tell "browsers hitting the fallback site
+//! without SNI" apart from "something sending us garbage".
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncReadExt;
@@ -30,6 +31,23 @@ const HANDSHAKE_TYPE_CLIENT_HELLO: u8 = 0x01;
 const EXTENSION_SERVER_NAME: u16 = 0x0000;
 const SERVER_NAME_TYPE_HOST_NAME: u8 = 0x00;
 
+/// Outcome of sniffing a ClientHello for its SNI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProbeResult {
+    /// A structurally valid ClientHello was parsed and it carried an SNI.
+    Sni(String),
+    /// A structurally valid ClientHello was parsed, but it had no
+    /// `server_name` extension.
+    NoSni,
+    /// The bytes received don't look like a TLS handshake at all (or
+    /// are malformed in a way we don't attempt to recover from).
+    NotTls,
+    /// The peer closed the connection before we received enough data to
+    /// decide (e.g. a bare TCP connect+close from a port scanner or
+    /// health checker).
+    ConnectionClosed,
+}
+
 enum ParseOutcome {
     /// Parsing finished: if the ClientHello is valid but has no SNI, `None`.
     Complete(Option<String>),
@@ -42,35 +60,35 @@ enum ParseOutcome {
 /// Reads from `stream`, trying to recognize a TLS ClientHello in the
 /// data and extract its SNI. Returns all bytes read (they will need to
 /// be "replayed" further on — either into the proxy or into the TLS
-/// acceptor) along with the SNI host, if one was found.
+/// acceptor) along with the classification.
 ///
 /// Never fails on garbage/invalid data — in that case it simply returns
-/// `None` together with whatever was read so far.
-pub async fn probe_client_hello(
-    stream: &mut TcpStream,
-) -> std::io::Result<(Bytes, Option<String>)> {
+/// `ProbeResult::NotTls` together with whatever was read so far.
+pub async fn probe_client_hello(stream: &mut TcpStream) -> std::io::Result<(Bytes, ProbeResult)> {
     let mut buf = BytesMut::with_capacity(4096);
     let mut tmp = [0u8; 4096];
 
     loop {
         let n = stream.read(&mut tmp).await?;
         if n == 0 {
-            // Client closed the connection before sending a full ClientHello.
-            return Ok((buf.freeze(), None));
+            return Ok((buf.freeze(), ProbeResult::ConnectionClosed));
         }
         buf.extend_from_slice(&tmp[..n]);
 
         match parse_sni(&buf) {
-            ParseOutcome::Complete(host) => return Ok((buf.freeze(), host)),
+            ParseOutcome::Complete(Some(host)) => {
+                return Ok((buf.freeze(), ProbeResult::Sni(host)));
+            }
+            ParseOutcome::Complete(None) => return Ok((buf.freeze(), ProbeResult::NoSni)),
             ParseOutcome::Incomplete => {
                 if buf.len() >= MAX_PROBE_BYTES {
                     // Past a reasonable limit — let the fallback TLS
                     // stack sort it out.
-                    return Ok((buf.freeze(), None));
+                    return Ok((buf.freeze(), ProbeResult::NotTls));
                 }
                 continue;
             }
-            ParseOutcome::Invalid => return Ok((buf.freeze(), None)),
+            ParseOutcome::Invalid => return Ok((buf.freeze(), ProbeResult::NotTls)),
         }
     }
 }
@@ -232,10 +250,35 @@ mod tests {
         sni_ext.extend_from_slice(&(name_bytes.len() as u16).to_be_bytes());
         sni_ext.extend_from_slice(name_bytes);
 
+        push_client_hello(hs_body, Some(sni_ext))
+    }
+
+    /// Same as above, but with an empty extensions block — used to test
+    /// the `NoSni`/`Complete(None)` classification path.
+    fn build_client_hello_without_sni() -> Vec<u8> {
+        let mut hs_body = Vec::new();
+        hs_body.extend_from_slice(&[0x03, 0x03]);
+        hs_body.extend_from_slice(&[0u8; 32]);
+        hs_body.push(0);
+        hs_body.extend_from_slice(&2u16.to_be_bytes());
+        hs_body.extend_from_slice(&[0x13, 0x01]);
+        hs_body.push(1);
+        hs_body.push(0);
+
+        push_client_hello(hs_body, None)
+    }
+
+    /// Wraps `hs_body` (everything up to, but not including, the
+    /// extensions block) with an `extensions` block containing either a
+    /// single server_name extension or none, then wraps the result in a
+    /// Handshake header and a TLS record header.
+    fn push_client_hello(mut hs_body: Vec<u8>, sni_ext: Option<Vec<u8>>) -> Vec<u8> {
         let mut ext = Vec::new();
-        ext.extend_from_slice(&0u16.to_be_bytes()); // ext type = server_name
-        ext.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
-        ext.extend_from_slice(&sni_ext);
+        if let Some(sni_ext) = sni_ext {
+            ext.extend_from_slice(&0u16.to_be_bytes()); // ext type = server_name
+            ext.extend_from_slice(&(sni_ext.len() as u16).to_be_bytes());
+            ext.extend_from_slice(&sni_ext);
+        }
 
         hs_body.extend_from_slice(&(ext.len() as u16).to_be_bytes());
         hs_body.extend_from_slice(&ext);
@@ -260,6 +303,15 @@ mod tests {
         match parse_sni(&record) {
             ParseOutcome::Complete(Some(host)) => assert_eq!(host, "example.com"),
             _ => panic!("expected to parse SNI"),
+        }
+    }
+
+    #[test]
+    fn client_hello_without_sni_extension_is_complete_with_none() {
+        let record = build_client_hello_without_sni();
+        match parse_sni(&record) {
+            ParseOutcome::Complete(None) => {}
+            _ => panic!("expected a valid ClientHello with no SNI to map to Complete(None)"),
         }
     }
 

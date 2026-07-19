@@ -5,7 +5,7 @@ use tokio::fs;
 use anyhow::Context;
 use serde::Deserialize;
 
-/// Configuration for the telemt front.
+/// Configuration for the service front.
 ///
 /// Loaded from a TOML file (the path is taken from the `REPROX_CONFIG`
 /// environment variable, defaulting to `config.toml` in the working
@@ -18,12 +18,11 @@ pub struct ServiceConfig {
     /// Address the front itself listens on (usually 0.0.0.0:443).
     pub listen_addr: SocketAddr,
 
-    /// Local address of telemt (the MTProto proxy with FakeTLS).
-    pub telemt_addr: String,
+    /// Local address of service.
+    pub proxy_addr: String,
 
-    /// Secret domain(s) from telemt's FakeTLS secret. If the SNI of an
-    /// incoming TLS connection matches one of these, the connection is
-    /// transparently proxied to telemt_addr with no TLS termination on
+    /// Secret domain(s). If the SNI of an incoming TLS connection matches one of these,
+    /// the connection is transparently proxied to service_addr with no TLS termination on
     /// this side.
     pub secret_domains: Vec<String>,
 
@@ -94,8 +93,8 @@ impl ServiceConfig {
             self.listen_addr = addr;
         }
 
-        if let Ok(v) = std::env::var("REPROX_TELEMT_ADDR") {
-            self.telemt_addr = v;
+        if let Ok(v) = std::env::var("REPROX_PROXY_ADDR") {
+            self.proxy_addr = v;
         }
         if let Ok(v) = std::env::var("REPROX_SECRET_DOMAINS") {
             self.secret_domains = v
@@ -164,7 +163,7 @@ impl ServiceConfig {
         Ok(())
     }
 
-    /// Compares an SNI hostname against the list of telemt secret domains.
+    /// Compares an SNI hostname against the list of service secret domains.
     /// Case-insensitive, and tolerant of a trailing FQDN dot.
     pub fn matches_secret_domain(&self, host: &str) -> bool {
         let host = host.trim_end_matches('.').to_ascii_lowercase();

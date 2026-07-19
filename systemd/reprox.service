@@ -1,9 +1,9 @@
 [Unit]
-Description=reprox (SNI routing for telemt / FakeTLS)
+Description=reprox (SNI routing for hidden service)
 After=network-online.target
 Wants=network-online.target
-# If telemt is also managed by systemd, this service starts after it.
-After=telemt.service
+# If service is also managed by systemd, this service starts after it.
+After=srv.service
 
 [Service]
 Type=simple

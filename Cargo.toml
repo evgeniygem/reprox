@@ -2,7 +2,7 @@
 name = "reprox"
 version = "0.1.0"
 edition = "2024"
-description = "SNI-routing front for telemt (MTProto/FakeTLS): proxies the secret SNI to telemt, serves everything else as an ordinary HTTPS site."
+description = "SNI-routing front for service: proxies the secret SNI to service, serves everything else as an ordinary HTTPS site."
 license = "MIT"
 
 [dependencies]
@@ -13,7 +13,7 @@ rustls = "0.23"
 tokio-rustls = "0.26"
 rustls-pki-types = "1.15"
 
-# HTTP (fallback site)# HTTP (fallback site)
+# HTTP (fallback site)
 hyper = { version = "1", features = ["full"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -23,6 +23,7 @@ bytes = "1"
 # Configuration
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+serde_json = "1"
 
 # Utilities
 anyhow = "1"
