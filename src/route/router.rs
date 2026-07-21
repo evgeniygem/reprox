@@ -53,8 +53,7 @@ impl Router {
         site: Arc<StaticSite>,
         config: Arc<ServiceConfig>,
     ) -> Self {
-        let mut routes =
-            HashMap::with_capacity_and_hasher(config.routes.len(), FxBuildHasher::default());
+        let mut routes = HashMap::with_capacity_and_hasher(config.routes.len(), FxBuildHasher);
 
         for route in config.routes.iter() {
             routes.insert(route.sni.clone(), route.clone());

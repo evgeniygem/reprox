@@ -13,8 +13,8 @@ use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServiceConfig;
 use crate::metrics::Stats;
-use crate::route::fallback::StaticSite;
 use crate::route::Router;
+use crate::route::fallback::StaticSite;
 
 /// How long to wait, after a shutdown signal (SIGINT/Ctrl+C or SIGTERM),
 /// for already-accepted connections (in-flight proxy sessions and
@@ -108,7 +108,7 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut sig) => {
                 sig.recv().await;

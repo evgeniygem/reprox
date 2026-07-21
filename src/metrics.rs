@@ -16,12 +16,12 @@
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use http::{header, Method, Request, Response, StatusCode};
+use http::{Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -29,7 +29,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 
 use crate::config::ServiceConfig;
-use crate::http_util::{full_body, ResponseBody};
+use crate::http_util::{ResponseBody, full_body};
 
 /// Which code path a connection took. Used to pick which "active
 /// connections" gauge and duration accumulator an `ActiveGuard`
