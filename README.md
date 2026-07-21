@@ -27,11 +27,14 @@ into the service upstream or into the TLS acceptor.
    close the connection itself.
 3. The bytes that were read (`prefix`) are returned either way — they
    are still needed.
-4. If `SNI ∈ secret_domains`, `route::proxy` opens a
-   connection to `proxy_addr`, sends it `prefix`, and then shuttles
-   bytes in both directions via `tokio::io::copy_bidirectional`. service
-   itself thinks it's talking directly to the client — not a single
-   byte of the FakeTLS handshake is altered or lost.
+4. If the SNI matches one of the configured `routes` entries,
+   `route::proxy` opens a connection to that route's `upstream`, sends
+   it `prefix`, and then shuttles bytes in both directions via
+   `tokio::io::copy_bidirectional`. The matched service itself thinks
+   it's talking directly to the client — not a single byte of the
+   FakeTLS handshake is altered or lost. `routes` is a list, so a
+   single `reprox` instance can front more than one hidden service,
+   each behind its own SNI.
 5. Otherwise, `route::serve` wraps the socket in a
    `PrefixedStream` (first hands out `prefix`, then reads from the real
    socket) and passes it to `tokio_rustls::TlsAcceptor`. After a
@@ -51,17 +54,42 @@ another — except here it's two code paths in one process on one port.
 
 ## Building
 
+Requires Rust 1.88 or newer (edition 2024) — `config.rs` uses let-chains
+(`if let ... && let ...`), which are only available on that edition.
+
 ```bash
 cargo build --release
 # binary: target/release/reprox
 ```
 
+The first build resolves and pins exact dependency versions into
+`Cargo.lock`; commit that file so subsequent builds (and deployments)
+use the exact versions you tested against.
+
 ## Configuration
 
 1. Copy `config.toml` to `/etc/reprox/config.toml` and edit it:
-    - `proxy_addr` — where service actually listens (usually
-      `127.0.0.1:PORT`).
-    - `secret_domains` — the domain(s) from service's secret.
+    - `routes` — one `[[routes]]` block per hidden service, each with:
+      - `sni` — the secret domain for that service.
+      - `upstream` — where that service actually listens (usually
+        `127.0.0.1:PORT`).
+
+      A single `reprox` instance can front several services this way —
+      just add another `[[routes]]` block:
+
+      ```toml
+      [[routes]]
+      sni = "domain.com"
+      upstream = "127.0.0.1:8080"
+
+      [[routes]]
+      sni = "api.domain.com"
+      upstream = "127.0.0.1:4443"
+      ```
+
+      Each `sni` must be unique (checked at startup) and is matched
+      case-insensitively with any trailing dot ignored, exactly like a
+      TLS `server_name` value would be.
     - `tls_cert_path` / `tls_key_path` — a real certificate/key for the
       domain this server resolves to (see `certs/README.md`).
     - `static_dir` — path to the `static/` directory (or your own copy).
@@ -69,9 +97,9 @@ cargo build --release
    domain in `robots.txt`) with your own — if several operators use
    this template verbatim and unmodified, the sites become easy to
    fingerprint by response bytes.
-3. Make sure DNS is set up so that the domain in `secret_domains` **and**
-   the certificate's domain both resolve to this server's IP (this
-   should already be the case per the task description).
+3. Make sure DNS is set up so that every `sni` in `routes` **and** the
+   certificate's domain both resolve to this server's IP (this should
+   already be the case per the task description).
 
 ### Binding port 443 without root
 
@@ -131,7 +159,7 @@ increasing — suitable for `rate()`/`increase()` in Prometheus.
 | `reprox_http_requests_total`                   | counter | `method=GET\|HEAD\|OPTIONS\|other`                   | Fallback-site requests by method.                                                                                  |
 | `reprox_http_responses_total`                  | counter | `status=200\|204\|304\|404\|405\|other`              | Fallback-site responses by status code.                                                                            |
 | `reprox_http_response_bytes_total`             | counter | —                                                    | Approximate response body bytes sent (from `Content-Length`).                                                      |
-| `reprox_config_secret_domains`                 | gauge   | —                                                    | Number of configured service secret domains — a quick sanity check that config reloaded correctly after a restart. |
+| `reprox_config_secret_domains`                 | gauge   | —                                                    | Number of configured `routes` entries (kept under its original name for dashboard/alert compatibility) — a quick sanity check that config reloaded correctly after a restart. |
 
 Sample check after enabling `metrics_addr = "127.0.0.1:9090"`:
 
@@ -156,8 +184,6 @@ outright.
 |---------------------------------|----------------------------------------|
 | `REPROX_CONFIG`                 | path to the TOML file itself           |
 | `REPROX_LISTEN_ADDR`            | `listen_addr`                          |
-| `REPROX_PROXY_ADDR`             | `proxy_addr`                           |
-| `REPROX_SECRET_DOMAINS`         | `secret_domains` (comma-separated)     |
 | `REPROX_TLS_CERT_PATH`          | `tls_cert_path`                        |
 | `REPROX_TLS_KEY_PATH`           | `tls_key_path`                         |
 | `REPROX_STATIC_DIR`             | `static_dir`                           |
@@ -200,6 +226,19 @@ Technical endpoints are unreachable from outside by construction: the
 only public port is `listen_addr` (443), and it has no paths like
 `/metrics`/`/admin`; `metrics_addr` (if enabled) is validated twice and
 must be a loopback address.
+
+## Shutdown behavior
+
+`reprox` shuts down gracefully on either SIGINT (Ctrl+C in a terminal)
+or SIGTERM (`systemd`'s default `KillSignal`, sent by `systemctl
+stop`/`restart`): it immediately stops accepting new connections but
+waits up to 30 seconds for connections it had already accepted (an
+in-progress proxy session, a static file mid-download) to finish on
+their own before exiting. If your systemd unit's `TimeoutStopSec` is
+shorter than that, raise it (or lower the grace period in `main.rs`) so
+a routine restart doesn't cut connections off mid-stream — `systemd`
+escalates to SIGKILL once `TimeoutStopSec` elapses, which no
+application-level handling can intercept.
 
 ## Known limitations of this implementation (stated plainly, so nothing surprises you in production)
 

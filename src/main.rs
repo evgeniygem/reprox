@@ -6,20 +6,30 @@ mod route;
 mod sni;
 mod tls;
 
-use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
-
-use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpListener, TcpStream};
-use tokio::time::timeout;
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServiceConfig;
 use crate::metrics::Stats;
 use crate::route::fallback::StaticSite;
-use crate::sni::ProbeResult;
+use crate::route::Router;
+
+/// How long to wait, after a shutdown signal (SIGINT/Ctrl+C or SIGTERM),
+/// for already-accepted connections (in-flight proxy sessions and
+/// fallback HTTP responses) to finish on their own before the process
+/// exits and the Tokio runtime aborts whatever tasks are still running.
+/// Chosen to comfortably cover a large static-file download or a
+/// short-lived proxy session without making an operator wait too long
+/// for a routine restart.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+
+/// How long to sleep after a transient `accept()` error before trying
+/// again. Without this, an error that keeps recurring on every call
+/// (e.g. the process running out of file descriptors) would otherwise
+/// spin the accept loop at 100% CPU instead of accepting connections.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -35,8 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let config = Arc::new(ServiceConfig::try_load().await?);
     tracing::info!(
         listen = %config.listen_addr,
-        proxy = %config.proxy_addr,
-        secret_domains = ?config.secret_domains,
+        routes = ?config.routes,
         tls_profile = %config.tls_min_version,
         "configuration loaded"
     );
@@ -60,117 +69,114 @@ async fn main() -> anyhow::Result<()> {
     let listener = TcpListener::bind(config.listen_addr).await?;
     tracing::info!(addr = %config.listen_addr, "reprox is listening");
 
+    // Router::new takes ownership of one Arc<Stats>; keep our own clone
+    // so we can still read the active-connection gauges after it (and
+    // accept_loop, and the listener) are dropped below.
+    let router = Router::new(acceptor, stats.clone(), site, config);
+
     tokio::select! {
-        res = accept_loop(listener, config, acceptor, site, stats) => res?,
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C, shutting down");
-        }
+        res = accept_loop(listener, router) => res?,
+        _ = shutdown_signal() => {}
     }
+
+    // The listener (owned by accept_loop's future, now dropped) is
+    // closed, so no new connections can arrive. Give connections that
+    // were already accepted — an in-progress proxy session, a large
+    // static file mid-download — a chance to finish on their own
+    // instead of being aborted mid-stream the instant this function
+    // returns and the Tokio runtime shuts down.
+    wait_for_drain(&stats, SHUTDOWN_GRACE).await;
 
     Ok(())
 }
 
-async fn accept_loop(
-    listener: TcpListener,
-    config: Arc<ServiceConfig>,
-    acceptor: TlsAcceptor,
-    site: Arc<StaticSite>,
-    stats: Arc<Stats>,
-) -> anyhow::Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
-        let _ = stream.set_nodelay(true);
-
-        let config = config.clone();
-        let acceptor = acceptor.clone();
-        let site = site.clone();
-        let stats = stats.clone();
-
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, peer, config, acceptor, site, stats).await {
-                tracing::debug!(%peer, error = %e, "connection ended with an error");
-            }
-        });
-    }
-}
-
-/// Routing for a single incoming TCP connection:
-/// 1. Sniff the SNI out of the ClientHello without establishing our own
-///    TLS session, classifying the result for both routing and metrics
-///    (see `sni::ProbeResult`).
-/// 2. If the SNI matches service's secret domain, transparently proxy the
-///    TCP stream (together with the already-read buffer) to service.
-/// 3. Otherwise, terminate TLS ourselves using the real certificate and
-///    serve the fallback site. This also covers: no SNI present, and an
-///    outright invalid ClientHello — in both cases we still attempt a
-///    full TLS handshake, just like an ordinary HTTPS server would.
-async fn handle_connection(
-    mut stream: TcpStream,
-    peer: SocketAddr,
-    config: Arc<ServiceConfig>,
-    acceptor: TlsAcceptor,
-    site: Arc<StaticSite>,
-    stats: Arc<Stats>,
-) -> anyhow::Result<()> {
-    let probe_timeout = Duration::from_secs(config.handshake_timeout_secs);
-
-    let (prefix, probe_result) =
-        match timeout(probe_timeout, sni::probe_client_hello(&mut stream)).await {
-            Ok(Ok(v)) => v,
-            Ok(Err(e)) => {
-                tracing::debug!(%peer, error = %e, "read error while sniffing SNI");
-                stats
-                    .connections_probe_io_error_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
-            Err(_) => {
-                tracing::debug!(%peer, "timed out waiting for the ClientHello");
-                stats
-                    .connections_probe_timeout_total
-                    .fetch_add(1, Ordering::Relaxed);
-                let _ = stream.shutdown().await;
-                return Ok(());
-            }
-        };
-
-    let sni_host = match &probe_result {
-        ProbeResult::Sni(host) => {
-            stats.sni_present_total.fetch_add(1, Ordering::Relaxed);
-            Some(host.clone())
-        }
-        ProbeResult::NoSni => {
-            stats.sni_absent_total.fetch_add(1, Ordering::Relaxed);
-            None
-        }
-        ProbeResult::NotTls => {
-            stats
-                .clienthello_not_tls_total
-                .fetch_add(1, Ordering::Relaxed);
-            None
-        }
-        ProbeResult::ConnectionClosed => {
-            stats
-                .connections_closed_early_total
-                .fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+/// Waits for whichever shutdown signal arrives first.
+///
+/// `tokio::signal::ctrl_c()` only ever fires on SIGINT — which covers
+/// Ctrl+C in an interactive terminal, but *not* `systemctl stop`, whose
+/// default `KillSignal` is SIGTERM. Without also handling SIGTERM here,
+/// the graceful drain in `main` would never run under the systemd unit
+/// this project's README documents: SIGTERM's default disposition is to
+/// terminate the process immediately, abruptly cutting off whatever
+/// connections were in flight.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "failed to install the Ctrl+C (SIGINT) handler");
         }
     };
 
-    let is_secret = sni_host
-        .as_deref()
-        .map(|h| config.matches_secret_domain(h))
-        .unwrap_or(false);
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => tracing::warn!(error = %e, "failed to install the SIGTERM handler"),
+        }
+    };
+    // Non-Unix targets (e.g. a Windows dev machine) have no SIGTERM;
+    // fall back to a future that never completes so `select!` below
+    // relies on Ctrl+C alone there.
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
 
-    if is_secret {
-        tracing::debug!(%peer, sni = ?sni_host, "SNI matched the secret domain — proxying to service");
-        let _active = stats.begin_proxied();
-        route::proxy(stream, prefix, &config.proxy_addr, stats.clone()).await
-    } else {
-        tracing::debug!(%peer, sni = ?sni_host, "SNI did not match — serving the fallback site");
-        let _active = stats.begin_fallback();
-        route::serve(stream, prefix, acceptor, site, config, stats.clone()).await
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received Ctrl+C (SIGINT), shutting down"),
+        _ = terminate => tracing::info!("received SIGTERM, shutting down"),
+    }
+}
+
+/// Polls the active-connection gauges until both routes have drained to
+/// zero or `grace_period` elapses, whichever comes first — see the
+/// call site in `main` for why this matters.
+async fn wait_for_drain(stats: &Stats, grace_period: Duration) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(200);
+    let deadline = tokio::time::Instant::now() + grace_period;
+
+    loop {
+        let active = stats.active_connections();
+        if active <= 0 {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            tracing::warn!(
+                active,
+                "shutdown grace period elapsed with connections still active; exiting anyway"
+            );
+            return;
+        }
+        tokio::time::sleep(POLL_INTERVAL).await;
+    }
+}
+
+async fn accept_loop(listener: TcpListener, router: Router) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(e) => {
+                // A transient accept() failure (e.g. the process
+                // temporarily out of file descriptors) previously
+                // propagated via `?` and brought the entire listener —
+                // and every other in-flight connection along with it —
+                // down. Log it and keep going instead; the short sleep
+                // avoids spinning at 100% CPU if the underlying
+                // condition doesn't clear up immediately.
+                tracing::warn!(error = %e, "accept() failed; retrying");
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                continue;
+            }
+        };
+        let _ = stream.set_nodelay(true);
+
+        let router = router.clone();
+
+        tokio::spawn(async move {
+            if let Err(e) = router.route(stream, peer).await {
+                tracing::debug!(%peer, error = %e, "connection ended with an error");
+            }
+        });
     }
 }
 

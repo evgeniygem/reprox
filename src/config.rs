@@ -18,13 +18,10 @@ pub struct ServiceConfig {
     /// Address the front itself listens on (usually 0.0.0.0:443).
     pub listen_addr: SocketAddr,
 
-    /// Local address of service.
-    pub proxy_addr: String,
-
-    /// Secret domain(s). If the SNI of an incoming TLS connection matches one of these,
-    /// the connection is transparently proxied to service_addr with no TLS termination on
+    /// Proxy targets. If the SNI of an incoming TLS connection matches one of these,
+    /// the connection is transparently proxied to upstream with no TLS termination on
     /// this side.
-    pub secret_domains: Vec<String>,
+    pub routes: Vec<ProxyTarget>,
 
     /// Path to the certificate (full chain, PEM) for the fallback site.
     pub tls_cert_path: PathBuf,
@@ -58,14 +55,42 @@ pub struct ServiceConfig {
     pub metrics_addr: Option<SocketAddr>,
 }
 
+/// A single `[[routes]]` entry from the config file: maps one SNI value
+/// to the upstream address that "secret" traffic for it should be
+/// transparently forwarded to.
+///
+/// `sni` is normalized (trailing dot stripped, lowercased) once, right
+/// after the config is parsed — see `ServiceConfig::try_load` — so
+/// every other place in the codebase can compare it as-is against the
+/// (equally normalized) SNI extracted from the ClientHello.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ProxyTarget {
+    /// The "secret" SNI/hostname this route matches on (e.g. `"domain.com"`).
+    pub sni: String,
+    /// Address (`host:port`) of the local service instance this route's
+    /// traffic is proxied to, e.g. `"127.0.0.1:8080"`. Accepts either an
+    /// IP:port pair or a resolvable hostname:port, since it is passed
+    /// directly to `TcpStream::connect`.
+    pub upstream: String,
+}
+
+/// Default `Server` header when `server_header` is omitted from the
+/// config: mimics a plain, up-to-date nginx install so the fallback
+/// site doesn't visibly announce it's actually `reprox`.
 fn default_server_header() -> String {
     "nginx/1.26.2 (Ubuntu)".to_string()
 }
 
+/// Default timeout, in seconds, for both the SNI probe and the
+/// fallback-path TLS handshake when `handshake_timeout_secs` is
+/// omitted. 10s comfortably covers real clients (including slow mobile
+/// networks) while still bounding slowloris-style stalls.
 fn default_handshake_timeout() -> u64 {
     10
 }
 
+/// Default TLS profile when `tls_min_version` is omitted: Mozilla
+/// Intermediate (TLS 1.2 + TLS 1.3) for maximum client compatibility.
 fn default_tls_min_version() -> String {
     "1.2".to_string()
 }
@@ -81,6 +106,16 @@ impl ServiceConfig {
         let mut cfg: ServiceConfig =
             toml::from_str(&raw).with_context(|| format!("failed to parse config file {path}"))?;
 
+        // Normalize configured SNIs the same way `sni::probe_client_hello`
+        // normalizes the SNI it extracts from the ClientHello (trailing
+        // dot stripped, lowercased). Doing it once here — rather than on
+        // every incoming connection — means `Router` can do a plain,
+        // case-sensitive HashMap lookup and still match
+        // "Domain.com." and "domain.com" as the same route.
+        cfg.routes
+            .iter_mut()
+            .for_each(|r| r.sni = r.sni.trim_end_matches('.').to_ascii_lowercase());
+
         cfg.apply_env_overrides();
         cfg.validate()?;
         Ok(cfg)
@@ -93,36 +128,32 @@ impl ServiceConfig {
             self.listen_addr = addr;
         }
 
-        if let Ok(v) = std::env::var("REPROX_PROXY_ADDR") {
-            self.proxy_addr = v;
-        }
-        if let Ok(v) = std::env::var("REPROX_SECRET_DOMAINS") {
-            self.secret_domains = v
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-        }
         if let Ok(v) = std::env::var("REPROX_TLS_CERT_PATH") {
             self.tls_cert_path = PathBuf::from(v);
         }
+
         if let Ok(v) = std::env::var("REPROX_TLS_KEY_PATH") {
             self.tls_key_path = PathBuf::from(v);
         }
+
         if let Ok(v) = std::env::var("REPROX_STATIC_DIR") {
             self.static_dir = PathBuf::from(v);
         }
+
         if let Ok(v) = std::env::var("REPROX_SERVER_HEADER") {
             self.server_header = v;
         }
+
         if let Ok(v) = std::env::var("REPROX_HANDSHAKE_TIMEOUT_SECS")
             && let Ok(n) = v.parse()
         {
             self.handshake_timeout_secs = n;
         }
+
         if let Ok(v) = std::env::var("REPROX_TLS_MIN_VERSION") {
             self.tls_min_version = v;
         }
+
         if let Ok(v) = std::env::var("REPROX_METRICS_ADDR")
             && let Ok(addr) = v.parse()
         {
@@ -131,13 +162,25 @@ impl ServiceConfig {
     }
 
     fn validate(&self) -> anyhow::Result<()> {
-        if self.secret_domains.is_empty() {
-            anyhow::bail!("secret_domains must not be empty");
-        }
-        for d in &self.secret_domains {
-            if d.trim().is_empty() {
-                anyhow::bail!("secret_domains contains an empty string");
+        // Note: an empty `routes` list is intentionally allowed — it's a
+        // valid configuration for a server that only ever serves the
+        // fallback site (no hidden service behind it).
+        let mut seen_sni = std::collections::HashSet::with_capacity(self.routes.len());
+        for target in &self.routes {
+            if target.sni.trim().is_empty() || target.upstream.trim().is_empty() {
+                anyhow::bail!("routes contains an empty string");
             }
+            // `Router::new` builds its lookup table with a plain HashMap
+            // insert, which would silently let a later duplicate
+            // shadow an earlier one — fail loudly here instead, since a
+            // duplicate SNI is almost certainly a copy-paste mistake in
+            // the config rather than something intentional.
+            if !seen_sni.insert(target.sni.as_str()) {
+                anyhow::bail!("duplicate sni in routes: {:?}", target.sni);
+            }
+        }
+        if self.handshake_timeout_secs == 0 {
+            anyhow::bail!("handshake_timeout_secs must be greater than 0");
         }
         if !self.tls_cert_path.is_file() {
             anyhow::bail!("tls_cert_path not found: {:?}", self.tls_cert_path);
@@ -163,14 +206,5 @@ impl ServiceConfig {
             anyhow::bail!("metrics_addr must be a loopback address (127.0.0.1/::1), got {addr}");
         }
         Ok(())
-    }
-
-    /// Compares an SNI hostname against the list of service secret domains.
-    /// Case-insensitive, and tolerant of a trailing FQDN dot.
-    pub fn matches_secret_domain(&self, host: &str) -> bool {
-        let host = host.trim_end_matches('.').to_ascii_lowercase();
-        self.secret_domains
-            .iter()
-            .any(|d| d.trim_end_matches('.').eq_ignore_ascii_case(&host))
     }
 }

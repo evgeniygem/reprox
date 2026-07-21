@@ -1,6 +1,6 @@
 pub mod fallback;
 mod proxy;
+mod router;
 mod serve;
 
-pub(crate) use proxy::proxy;
-pub(crate) use serve::serve;
+pub(crate) use router::Router;

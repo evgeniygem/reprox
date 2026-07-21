@@ -5,19 +5,16 @@
 # variable. Every field below can likewise be overridden by an
 # environment variable named REPROX_<FIELD_NAME_UPPERCASE> (see README.md) —
 # handy for systemd/docker so you don't have to keep paths/secrets on disk.
+#
+# IMPORTANT: in TOML, once an [[routes]] array-of-tables header appears,
+# every later bare `key = value` line attaches to the *last* routes entry,
+# not to the top-level document. So all top-level scalar fields below
+# MUST come before the [[routes]] blocks — do not move them after.
 # ============================================================================
 
 # Address the front server itself listens on. Port 443 requires either
 # root or CAP_NET_BIND_SERVICE on the binary (see README.md).
 listen_addr = "0.0.0.0:443"
-
-# Local address service listens on.
-proxy_addr = "127.0.0.1:8888"
-
-# One or more "secret" domains baked into service's secret. If the
-# SNI of an incoming TLS connection matches one of these, the connection
-# is transparently proxied to proxy_addr (no TLS termination on this side).
-secret_domains = ["www.example-fronting-domain.com"]
 
 # Certificate (full chain, PEM) and private key (PEM) for the fallback
 # site. The certificate must be issued for the domain this VPS resolves
@@ -35,7 +32,7 @@ server_header = "nginx/1.26.2 (Ubuntu)"
 
 # Timeout (seconds) for reading/parsing the ClientHello and for the
 # fallback path's TLS handshake. Protects against stuck/slowloris-style
-# connections.
+# connections. Must be greater than 0 (enforced at startup).
 handshake_timeout_secs = 10
 
 # TLS profile for the fallback site:
@@ -48,3 +45,17 @@ tls_min_version = "1.2"
 # start if you set anything else. If commented out, metrics are disabled
 # and no extra port is opened at all.
 metrics_addr = "127.0.0.1:9090"
+
+# One [[routes]] block per hidden service. If the SNI of an incoming TLS
+# connection matches a route's `sni`, the connection is transparently
+# proxied to that route's `upstream` (no TLS termination on this side).
+# Each `sni` must be unique; both fields are required and may not be empty.
+# NOTE: keep all [[routes]] blocks at the end of the file, after every
+# top-level scalar field above (see the TOML ordering warning at the top).
+[[routes]]
+sni = "domain.com"
+upstream = "127.0.0.1:8080"
+
+[[routes]]
+sni = "api.domain.com"
+upstream = "127.0.0.1:4443"

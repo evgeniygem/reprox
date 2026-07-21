@@ -16,12 +16,12 @@
 use std::convert::Infallible;
 use std::fmt::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
-use http::{Method, Request, Response, StatusCode, header};
+use http::{header, Method, Request, Response, StatusCode};
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -29,7 +29,7 @@ use serde::Serialize;
 use tokio::net::TcpListener;
 
 use crate::config::ServiceConfig;
-use crate::http_util::{ResponseBody, full_body};
+use crate::http_util::{full_body, ResponseBody};
 
 /// Which code path a connection took. Used to pick which "active
 /// connections" gauge and duration accumulator an `ActiveGuard`
@@ -202,6 +202,14 @@ impl Stats {
         self.start.elapsed().as_secs_f64()
     }
 
+    /// Total number of connections currently being served, across both
+    /// routes. Used by `main`'s graceful-shutdown drain to know when it's
+    /// safe to exit; also handy as a quick "is anything still happening"
+    /// check outside of Prometheus/JSON scraping.
+    pub fn active_connections(&self) -> i64 {
+        self.active_proxied.load(Ordering::Relaxed) + self.active_fallback.load(Ordering::Relaxed)
+    }
+
     fn snapshot(&self, config: &ServiceConfig) -> MetricsSnapshot {
         MetricsSnapshot {
             uptime_seconds: self.uptime_seconds(),
@@ -265,7 +273,7 @@ impl Stats {
                 bytes_sent_total: self.http_bytes_sent_total.load(Ordering::Relaxed),
             },
             config: ConfigSnapshot {
-                secret_domains_count: config.secret_domains.len(),
+                routes_count: config.routes.len(),
                 tls_profile: config.tls_min_version.clone(),
             },
         }
@@ -486,12 +494,18 @@ impl Stats {
             &[(&[], Value::U(s.http.bytes_sent_total))],
         );
 
+        // Name kept as `reprox_config_secret_domains` for backward
+        // compatibility with existing dashboards/alerts from when the
+        // config only supported a single service behind a flat list of
+        // secret domains; it now reflects `routes.len()` (each entry a
+        // distinct sni -> upstream mapping), which is what the HELP text
+        // and the JSON field (`config.routes_count`) both describe.
         push_metric(
             &mut out,
             "reprox_config_secret_domains",
             "gauge",
-            "Number of service secret domains currently configured.",
-            &[(&[], Value::U(s.config.secret_domains_count as u64))],
+            "Number of service routes currently configured.",
+            &[(&[], Value::U(s.config.routes_count as u64))],
         );
 
         out
@@ -615,7 +629,7 @@ struct HttpSnapshot {
 
 #[derive(Serialize)]
 struct ConfigSnapshot {
-    secret_domains_count: usize,
+    routes_count: usize,
     tls_profile: String,
 }
 
