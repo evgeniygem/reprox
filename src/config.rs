@@ -53,6 +53,13 @@ pub struct ServiceConfig {
     /// If unset, metrics are disabled and no extra port is opened at all.
     #[serde(default)]
     pub metrics_addr: Option<SocketAddr>,
+
+    /// Hard cap on the number of connections handled at once, across
+    /// both routes combined. Once this many connections are in flight,
+    /// `main::accept_loop` stops pulling new ones off the kernel accept
+    /// queue until a slot frees up.
+    #[serde(default = "default_max_connections")]
+    pub max_connections: usize,
 }
 
 /// A single `[[routes]]` entry from the config file: maps one SNI value
@@ -60,9 +67,7 @@ pub struct ServiceConfig {
 /// transparently forwarded to.
 ///
 /// `sni` is normalized (trailing dot stripped, lowercased) once, right
-/// after the config is parsed — see `ServiceConfig::try_load` — so
-/// every other place in the codebase can compare it as-is against the
-/// (equally normalized) SNI extracted from the ClientHello.
+/// after the config is parsed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProxyTarget {
     /// The "secret" SNI/hostname this route matches on (e.g. `"domain.com"`).
@@ -95,6 +100,15 @@ fn default_tls_min_version() -> String {
     "1.2".to_string()
 }
 
+/// Default cap on simultaneous connections when `max_connections` is
+/// omitted. 10,000 comfortably covers a busy single-instance deployment
+/// while still bounding worst-case fd/memory usage — each proxied
+/// connection uses two sockets (client + upstream), so steady-state fd
+/// usage on that route is bounded to roughly 2x this value.
+fn default_max_connections() -> usize {
+    10_000
+}
+
 impl ServiceConfig {
     pub async fn try_load() -> anyhow::Result<Self> {
         let path = std::env::var("REPROX_CONFIG").unwrap_or_else(|_| "config.toml".to_string());
@@ -108,10 +122,7 @@ impl ServiceConfig {
 
         // Normalize configured SNIs the same way `sni::probe_client_hello`
         // normalizes the SNI it extracts from the ClientHello (trailing
-        // dot stripped, lowercased). Doing it once here — rather than on
-        // every incoming connection — means `Router` can do a plain,
-        // case-sensitive HashMap lookup and still match
-        // "Domain.com." and "domain.com" as the same route.
+        // dot stripped, lowercased).
         cfg.routes
             .iter_mut()
             .for_each(|r| r.sni = r.sni.trim_end_matches('.').to_ascii_lowercase());
@@ -159,6 +170,12 @@ impl ServiceConfig {
         {
             self.metrics_addr = Some(addr);
         }
+
+        if let Ok(v) = std::env::var("REPROX_MAX_CONNECTIONS")
+            && let Ok(n) = v.parse()
+        {
+            self.max_connections = n;
+        }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -178,6 +195,12 @@ impl ServiceConfig {
             if !seen_sni.insert(target.sni.as_str()) {
                 anyhow::bail!("duplicate sni in routes: {:?}", target.sni);
             }
+            // Catch the common typos (a stray "https://" prefix, a
+            // missing/garbled port, a trailing path) here, at startup,
+            // rather than as a connect failure the first time a real
+            // client's traffic happens to hit this route.
+            validate_upstream(&target.upstream)
+                .with_context(|| format!("invalid upstream for sni {:?}", target.sni))?;
         }
         if self.handshake_timeout_secs == 0 {
             anyhow::bail!("handshake_timeout_secs must be greater than 0");
@@ -205,6 +228,152 @@ impl ServiceConfig {
         {
             anyhow::bail!("metrics_addr must be a loopback address (127.0.0.1/::1), got {addr}");
         }
+        if self.max_connections == 0 {
+            anyhow::bail!("max_connections must be greater than 0");
+        }
         Ok(())
+    }
+
+    /// Logs a warning for every field that a SIGHUP reload
+    /// (`main::hot_reload`) cannot apply live but that changed
+    /// anyway between `self` (the configuration still running) and
+    /// `new` (what was just loaded from disk) — so an operator who
+    /// edited one of these and sent SIGHUP finds out from the logs that
+    /// nothing happened, rather than assuming the change took effect.
+    pub fn warn_about_unreloadable_changes(&self, new: &ServiceConfig) {
+        if self.listen_addr != new.listen_addr {
+            tracing::warn!(
+                old = %self.listen_addr,
+                new = %new.listen_addr,
+                "listen_addr changed in config.toml, but \
+                SIGHUP can't rebind the listener — restart the process to apply this"
+            );
+        }
+        if self.metrics_addr != new.metrics_addr {
+            tracing::warn!(
+                old = ?self.metrics_addr,
+                new = ?new.metrics_addr,
+                "metrics_addr changed in config.toml, but \
+                SIGHUP can't rebind the metrics listener — restart the process to apply this"
+            );
+        }
+        if self.tls_min_version != new.tls_min_version {
+            tracing::warn!(
+                old = %self.tls_min_version,
+                new = %new.tls_min_version,
+                "tls_min_version changed in config.toml, but SIGHUP only swaps the certificate,\
+                 not the negotiated TLS versions — restart the process to apply this"
+            );
+        }
+        if self.max_connections != new.max_connections {
+            tracing::warn!(
+                old = self.max_connections,
+                new = new.max_connections,
+                "max_connections changed in config.toml, but SIGHUP can't resize \
+                the connection-slot limiter — restart the process to apply this"
+            );
+        }
+    }
+}
+
+/// Verifies that `upstream` at least has the right *shape* —
+/// `host:port` with a valid, non-zero port, and a host that's either a
+/// literal IP address or a syntactically plausible hostname.
+fn validate_upstream(upstream: &str) -> anyhow::Result<()> {
+    // A bare `ip:port` — including a bracketed IPv6 literal like
+    // `[::1]:8080` — parses directly; nothing further to check.
+    if let Ok(addr) = upstream.parse::<SocketAddr>()
+        && addr.port() != 0
+    {
+        return Ok(());
+    }
+
+    if upstream.contains("://") {
+        anyhow::bail!("must be a host:port pair, not a URL with a scheme");
+    }
+    if upstream.chars().any(char::is_whitespace) {
+        anyhow::bail!("must not contain whitespace");
+    }
+
+    // Otherwise this should be `hostname:port`. Split on the *last*
+    // colon: an unbracketed IPv6 literal (which contains multiple
+    // colons) has already been rejected by the `SocketAddr` parse
+    // above and is ambiguous without brackets, so we don't try to
+    // special-case it here.
+    let (host, port) = upstream
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("must be a host:port pair (missing ':port')"))?;
+
+    if host.is_empty() {
+        anyhow::bail!("has an empty host before the ':'");
+    }
+    if host.contains('/') {
+        anyhow::bail!("must not contain a path");
+    }
+    if !host
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+    {
+        anyhow::bail!("host {host:?} contains characters not valid in a hostname");
+    }
+
+    match port.parse::<u16>() {
+        Ok(0) => anyhow::bail!("port 0 is not a valid upstream port"),
+        Ok(_) => Ok(()),
+        Err(_) => anyhow::bail!("{port:?} is not a valid port number"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_plain_ip_and_port() {
+        assert!(validate_upstream("127.0.0.1:8080").is_ok());
+        assert!(validate_upstream("0.0.0.0:443").is_ok());
+    }
+
+    #[test]
+    fn accepts_bracketed_ipv6() {
+        assert!(validate_upstream("[::1]:8080").is_ok());
+    }
+
+    #[test]
+    fn accepts_plausible_hostname() {
+        assert!(validate_upstream("backend.internal:8080").is_ok());
+        assert!(validate_upstream("service-2_a.local:4443").is_ok());
+    }
+
+    #[test]
+    fn rejects_missing_port() {
+        assert!(validate_upstream("127.0.0.1").is_err());
+        assert!(validate_upstream("backend.internal").is_err());
+    }
+
+    #[test]
+    fn rejects_url_scheme() {
+        assert!(validate_upstream("https://127.0.0.1:8080").is_err());
+    }
+
+    #[test]
+    fn rejects_trailing_path() {
+        assert!(validate_upstream("127.0.0.1:8080/").is_err());
+    }
+
+    #[test]
+    fn rejects_zero_port_and_garbage_port() {
+        assert!(validate_upstream("127.0.0.1:0").is_err());
+        assert!(validate_upstream("127.0.0.1:notaport").is_err());
+    }
+
+    #[test]
+    fn rejects_empty_host() {
+        assert!(validate_upstream(":8080").is_err());
+    }
+
+    #[test]
+    fn rejects_whitespace() {
+        assert!(validate_upstream("127.0.0.1 :8080").is_err());
     }
 }

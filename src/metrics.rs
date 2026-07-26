@@ -20,6 +20,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::Instant;
 
+use crate::config::ServiceConfig;
+use crate::http_util::{ResponseBody, full_body};
 use bytes::Bytes;
 use http::{Method, Request, Response, StatusCode, header};
 use hyper::body::Incoming;
@@ -27,9 +29,6 @@ use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use serde::Serialize;
 use tokio::net::TcpListener;
-
-use crate::config::ServiceConfig;
-use crate::http_util::{ResponseBody, full_body};
 
 /// Which code path a connection took. Used to pick which "active
 /// connections" gauge and duration accumulator an `ActiveGuard`
@@ -87,6 +86,7 @@ pub struct Stats {
     start: Instant,
 
     // --- connections ---
+    pub connections: AtomicU64,
     pub connections_proxied_total: AtomicU64,
     pub connections_fallback_total: AtomicU64,
     connections_proxied_completed_total: AtomicU64,
@@ -108,6 +108,7 @@ pub struct Stats {
     pub proxy_bytes_client_to_service_total: AtomicU64,
     pub proxy_bytes_service_to_client_total: AtomicU64,
     pub proxy_service_connect_failures_total: AtomicU64,
+    pub proxy_service_connect_retries_total: AtomicU64,
 
     // --- fallback TLS ---
     pub tls_handshake_success_total: AtomicU64,
@@ -134,6 +135,7 @@ impl Stats {
     pub fn new() -> Self {
         Self {
             start: Instant::now(),
+            connections: AtomicU64::new(0),
             connections_proxied_total: AtomicU64::new(0),
             connections_fallback_total: AtomicU64::new(0),
             connections_proxied_completed_total: AtomicU64::new(0),
@@ -151,6 +153,7 @@ impl Stats {
             proxy_bytes_client_to_service_total: AtomicU64::new(0),
             proxy_bytes_service_to_client_total: AtomicU64::new(0),
             proxy_service_connect_failures_total: AtomicU64::new(0),
+            proxy_service_connect_retries_total: AtomicU64::new(0),
             tls_handshake_success_total: AtomicU64::new(0),
             tls_handshake_failure_total: AtomicU64::new(0),
             alpn_h2_total: AtomicU64::new(0),
@@ -207,7 +210,7 @@ impl Stats {
     /// safe to exit; also handy as a quick "is anything still happening"
     /// check outside of Prometheus/JSON scraping.
     pub fn active_connections(&self) -> i64 {
-        self.active_proxied.load(Ordering::Relaxed) + self.active_fallback.load(Ordering::Relaxed)
+        self.connections.load(Ordering::Relaxed) as i64
     }
 
     fn snapshot(&self, config: &ServiceConfig) -> MetricsSnapshot {
@@ -235,6 +238,9 @@ impl Stats {
                     .connections_probe_io_error_total
                     .load(Ordering::Relaxed),
                 closed_early_total: self.connections_closed_early_total.load(Ordering::Relaxed),
+                connections_limit: config.max_connections as u64,
+                connections_available: (config.max_connections as u64)
+                    .saturating_sub(self.connections.load(Ordering::Relaxed)),
             },
             clienthello: ClientHelloSnapshot {
                 sni_present_total: self.sni_present_total.load(Ordering::Relaxed),
@@ -250,6 +256,9 @@ impl Stats {
                     .load(Ordering::Relaxed),
                 service_connect_failures_total: self
                     .proxy_service_connect_failures_total
+                    .load(Ordering::Relaxed),
+                service_connect_retries_total: self
+                    .proxy_service_connect_retries_total
                     .load(Ordering::Relaxed),
             },
             tls: TlsSnapshot {
@@ -382,6 +391,22 @@ impl Stats {
 
         push_metric(
             &mut out,
+            "reprox_connections_limit",
+            "gauge",
+            "Configured cap on connections handled at once, across both routes (max_connections).",
+            &[(&[], Value::U(s.connections.connections_limit))],
+        );
+
+        push_metric(
+            &mut out,
+            "reprox_connections_available",
+            "gauge",
+            "Connections currently free out of reprox_connections_limit. A sustained 0 means max_connections is the current bottleneck.",
+            &[(&[], Value::U(s.connections.connections_available))],
+        );
+
+        push_metric(
+            &mut out,
             "reprox_clienthello_total",
             "counter",
             "ClientHello classification results (see sni::ProbeResult).",
@@ -422,8 +447,16 @@ impl Stats {
             &mut out,
             "reprox_proxy_service_connect_failures_total",
             "counter",
-            "Failed TCP connections from this proxy to the local service instance.",
+            "Connections that could not reach the local service instance after exhausting connect retries (see reprox_proxy_service_connect_retries_total). A non-zero rate usually means the service is down or misconfigured.",
             &[(&[], Value::U(s.proxy.service_connect_failures_total))],
+        );
+
+        push_metric(
+            &mut out,
+            "reprox_proxy_service_connect_retries_total",
+            "counter",
+            "Individual failed connect attempts to the local service that were retried with backoff (excludes each route's final, giving-up attempt, which is counted in reprox_proxy_service_connect_failures_total instead). A high rate here relative to the failures counter means the service is usually just briefly slow to accept, not actually down.",
+            &[(&[], Value::U(s.proxy.service_connect_retries_total))],
         );
 
         push_metric(
@@ -587,6 +620,8 @@ struct ConnectionsSnapshot {
     probe_timeout_total: u64,
     probe_io_error_total: u64,
     closed_early_total: u64,
+    connections_limit: u64,
+    connections_available: u64,
 }
 
 #[derive(Serialize)]
@@ -601,6 +636,7 @@ struct ProxySnapshot {
     bytes_client_to_service_total: u64,
     bytes_service_to_client_total: u64,
     service_connect_failures_total: u64,
+    service_connect_retries_total: u64,
 }
 
 #[derive(Serialize)]

@@ -28,13 +28,15 @@ into the service upstream or into the TLS acceptor.
 3. The bytes that were read (`prefix`) are returned either way — they
    are still needed.
 4. If the SNI matches one of the configured `routes` entries,
-   `route::proxy` opens a connection to that route's `upstream`, sends
-   it `prefix`, and then shuttles bytes in both directions via
-   `tokio::io::copy_bidirectional`. The matched service itself thinks
-   it's talking directly to the client — not a single byte of the
-   FakeTLS handshake is altered or lost. `routes` is a list, so a
-   single `reprox` instance can front more than one hidden service,
-   each behind its own SNI.
+   `route::proxy` opens a connection to that route's `upstream` (retrying
+   up to 3 times with exponential backoff — 200ms, 400ms, 800ms between
+   attempts, each capped at a 3s timeout — if the service is briefly
+   unreachable, e.g. mid-restart), sends it `prefix`, and then shuttles
+   bytes in both directions via `tokio::io::copy_bidirectional`. The
+   matched service itself thinks it's talking directly to the client —
+   not a single byte of the FakeTLS handshake is altered or lost.
+   `routes` is a list, so a single `reprox` instance can front more than
+   one hidden service, each behind its own SNI.
 5. Otherwise, `route::serve` wraps the socket in a
    `PrefixedStream` (first hands out `prefix`, then reads from the real
    socket) and passes it to `tokio_rustls::TlsAcceptor`. After a
@@ -70,9 +72,9 @@ use the exact versions you tested against.
 
 1. Copy `config.toml` to `/etc/reprox/config.toml` and edit it:
     - `routes` — one `[[routes]]` block per hidden service, each with:
-      - `sni` — the secret domain for that service.
-      - `upstream` — where that service actually listens (usually
-        `127.0.0.1:PORT`).
+        - `sni` — the secret domain for that service.
+        - `upstream` — where that service actually listens (usually
+          `127.0.0.1:PORT`).
 
       A single `reprox` instance can front several services this way —
       just add another `[[routes]]` block:
@@ -89,10 +91,28 @@ use the exact versions you tested against.
 
       Each `sni` must be unique (checked at startup) and is matched
       case-insensitively with any trailing dot ignored, exactly like a
-      TLS `server_name` value would be.
+      TLS `server_name` value would be. Each `upstream` is also checked
+      at startup for being a syntactically valid `host:port` — a stray
+      `https://` prefix, a missing/garbled port, or a trailing path will
+      fail config loading with a clear error instead of silently only
+      surfacing later as `reprox_proxy_service_connect_failures_total`
+      once real traffic hits that route. This check does **not** resolve
+      hostnames (a hostname upstream may simply not be resolvable yet at
+      startup), so a typo'd-but-well-formed hostname will still only be
+      caught at connect time.
     - `tls_cert_path` / `tls_key_path` — a real certificate/key for the
       domain this server resolves to (see `certs/README.md`).
     - `static_dir` — path to the `static/` directory (or your own copy).
+    - `max_connections` (optional, default `10000`) — hard cap on
+      connections handled at once, across both routes combined. Once
+      this many connections are in flight, new ones simply queue in the
+      kernel's accept backlog until a slot frees up, instead of being
+      accepted without limit and exhausting file descriptors or memory —
+      the same role nginx's `worker_connections` plays. Each proxied
+      connection holds two sockets (client + upstream), so raise this
+      with that in mind if you're also tuning the process's file
+      descriptor limit (`ulimit -n` / `LimitNOFILE=` in the systemd
+      unit).
 2. Replace the placeholders in `static/` (company name, e-mail, the
    domain in `robots.txt`) with your own — if several operators use
    this template verbatim and unmodified, the sites become easy to
@@ -144,22 +164,25 @@ Everything below is tracked in-memory (reset on restart, not persisted)
 and, other than the active-connection gauges, is monotonically
 increasing — suitable for `rate()`/`increase()` in Prometheus.
 
-| Metric                                         | Type    | Labels                                               | What it tells you                                                                                                  |
-|------------------------------------------------|---------|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------|
-| `reprox_uptime_seconds`                        | gauge   | —                                                    | Time since the process started.                                                                                    |
-| `reprox_connections_total`                     | counter | `route=proxied\|fallback`                            | TCP connections accepted, by route.                                                                                |
-| `reprox_connections_active`                    | gauge   | `route=proxied\|fallback`                            | Connections currently being served.                                                                                |
-| `reprox_connection_duration_ms_sum` / `_count` | counter | `route=proxied\|fallback`                            | Sum/count of completed connections — divide for the average duration per route.                                    |
-| `reprox_connections_rejected_total`            | counter | `reason=probe_timeout\|probe_io_error\|closed_early` | Connections that never produced a usable ClientHello.                                                              |
-| `reprox_clienthello_total`                     | counter | `result=sni_present\|sni_absent\|not_tls`            | ClientHello classification — `not_tls` spiking is a useful signal for scanning/probing traffic.                    |
-| `reprox_proxy_bytes_total`                     | counter | `direction=client_to_service\|service_to_client`     | Bytes relayed between clients and service.                                                                         |
-| `reprox_proxy_service_connect_failures_total`  | counter | —                                                    | Failed TCP connects from this process to service — a non-zero rate usually means service is down or misconfigured. |
-| `reprox_tls_handshakes_total`                  | counter | `result=success\|failure`                            | Fallback-path TLS handshake outcomes.                                                                              |
-| `reprox_alpn_selected_total`                   | counter | `protocol=h2\|http1\|none`                           | Negotiated ALPN protocol on the fallback path.                                                                     |
-| `reprox_http_requests_total`                   | counter | `method=GET\|HEAD\|OPTIONS\|other`                   | Fallback-site requests by method.                                                                                  |
-| `reprox_http_responses_total`                  | counter | `status=200\|204\|304\|404\|405\|other`              | Fallback-site responses by status code.                                                                            |
-| `reprox_http_response_bytes_total`             | counter | —                                                    | Approximate response body bytes sent (from `Content-Length`).                                                      |
-| `reprox_config_secret_domains`                 | gauge   | —                                                    | Number of configured `routes` entries (kept under its original name for dashboard/alert compatibility) — a quick sanity check that config reloaded correctly after a restart. |
+| Metric                                         | Type    | Labels                                               | What it tells you                                                                                                                                                                                                              |
+|------------------------------------------------|---------|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `reprox_uptime_seconds`                        | gauge   | —                                                    | Time since the process started.                                                                                                                                                                                                |
+| `reprox_connections_total`                     | counter | `route=proxied\|fallback`                            | TCP connections accepted, by route.                                                                                                                                                                                            |
+| `reprox_connections_active`                    | gauge   | `route=proxied\|fallback`                            | Connections currently being served.                                                                                                                                                                                            |
+| `reprox_connection_duration_ms_sum` / `_count` | counter | `route=proxied\|fallback`                            | Sum/count of completed connections — divide for the average duration per route.                                                                                                                                                |
+| `reprox_connections_rejected_total`            | counter | `reason=probe_timeout\|probe_io_error\|closed_early` | Connections that never produced a usable ClientHello.                                                                                                                                                                          |
+| `reprox_connections_limit`                     | gauge   | —                                                    | Configured `max_connections` cap on connections handled at once, across both routes.                                                                                                                                           |
+| `reprox_connections_available`                 | gauge   | —                                                    | Free connection slots out of `reprox_connections_limit` right now. A sustained `0` means `max_connections` is the current bottleneck — new connections are queuing instead of being served.                                    |
+| `reprox_clienthello_total`                     | counter | `result=sni_present\|sni_absent\|not_tls`            | ClientHello classification — `not_tls` spiking is a useful signal for scanning/probing traffic.                                                                                                                                |
+| `reprox_proxy_bytes_total`                     | counter | `direction=client_to_service\|service_to_client`     | Bytes relayed between clients and service.                                                                                                                                                                                     |
+| `reprox_proxy_service_connect_failures_total`  | counter | —                                                    | Connections that couldn't reach service after exhausting connect retries (see below) — a non-zero rate usually means service is down or misconfigured.                                                                         |
+| `reprox_proxy_service_connect_retries_total`   | counter | —                                                    | Failed connect attempts to service that were retried with backoff (excludes each route's final, giving-up attempt). High relative to the failures counter above means service is usually just briefly slow, not actually down. |
+| `reprox_tls_handshakes_total`                  | counter | `result=success\|failure`                            | Fallback-path TLS handshake outcomes.                                                                                                                                                                                          |
+| `reprox_alpn_selected_total`                   | counter | `protocol=h2\|http1\|none`                           | Negotiated ALPN protocol on the fallback path.                                                                                                                                                                                 |
+| `reprox_http_requests_total`                   | counter | `method=GET\|HEAD\|OPTIONS\|other`                   | Fallback-site requests by method.                                                                                                                                                                                              |
+| `reprox_http_responses_total`                  | counter | `status=200\|204\|304\|404\|405\|other`              | Fallback-site responses by status code.                                                                                                                                                                                        |
+| `reprox_http_response_bytes_total`             | counter | —                                                    | Approximate response body bytes sent (from `Content-Length`).                                                                                                                                                                  |
+| `reprox_config_secret_domains`                 | gauge   | —                                                    | Number of configured `routes` entries (kept under its original name for dashboard/alert compatibility) — a quick sanity check that config loaded correctly after a restart or a SIGHUP reload.                                 |
 
 Sample check after enabling `metrics_addr = "127.0.0.1:9090"`:
 
@@ -191,6 +214,7 @@ outright.
 | `REPROX_HANDSHAKE_TIMEOUT_SECS` | `handshake_timeout_secs`               |
 | `REPROX_TLS_MIN_VERSION`        | `tls_min_version`                      |
 | `REPROX_METRICS_ADDR`           | `metrics_addr`                         |
+| `REPROX_MAX_CONNECTIONS`        | `max_connections`                      |
 | `RUST_LOG`                      | tracing log level (defaults to `info`) |
 
 ## Verifying after deployment
@@ -240,6 +264,47 @@ a routine restart doesn't cut connections off mid-stream — `systemd`
 escalates to SIGKILL once `TimeoutStopSec` elapses, which no
 application-level handling can intercept.
 
+## Reloading without a restart
+
+Send `SIGHUP` to reload `config.toml`, the `routes` table, the TLS
+certificate/key, and the static site — all without dropping a single
+in-flight connection:
+
+```
+sudo systemctl reload reprox     # if your unit sets ExecReload, see below
+# or directly:
+kill -HUP $(systemctl show --property MainPID --value reprox)
+```
+
+A connection already being served keeps running against whatever
+config/routes/site/certificate it had at the moment it was accepted; a
+SIGHUP only changes what's used for connections accepted *after* the
+reload completes — there's no window where one connection sees routes
+from one version mixed with a static site from another.
+
+If a reload fails partway (invalid TOML, a missing/mismatched cert or
+key, an unloadable static site), it's logged and otherwise ignored:
+`reprox` keeps running on whatever configuration it already had, rather
+than crashing or ending up in a half-applied state. Watch the logs after
+sending SIGHUP for either `"reload complete"` or a `"reload failed: ..."`
+line explaining what went wrong.
+
+**What SIGHUP does *not* reload** — `listen_addr`, `metrics_addr`,
+`tls_min_version`, and `max_connections`. Each of these is baked into
+something the process only builds once at startup (a bound listener, the
+`rustls::ServerConfig`'s negotiated TLS version set, a fixed-size
+connection-slot semaphore); changing one of these in `config.toml` and
+sending SIGHUP logs a warning telling you a restart is needed, rather
+than silently doing nothing or half-applying it.
+
+If your systemd unit doesn't already have one, add an `ExecReload` line
+so `systemctl reload` works as shown above:
+
+```ini
+[Service]
+ExecReload=/bin/kill -HUP $MAINPID
+```
+
 ## Known limitations of this implementation (stated plainly, so nothing surprises you in production)
 
 - The SNI parser handles a `ClientHello` that fits entirely within the
@@ -249,8 +314,12 @@ application-level handling can intercept.
   will end up on the fallback path, where the handshake still
   correctly fails at the rustls level — just as an ordinary TLS
   rejection rather than as "secret proxy".
-- The certificate/key and the static site are read once at startup; to
-  pick up a new certificate or new content, restart the process.
+- The certificate/key, `routes`, and the static site can be reloaded
+  without a restart by sending `SIGHUP` — see "Reloading without a
+  restart" below. `listen_addr`, `metrics_addr`, `tls_min_version`, and
+  `max_connections` still require a full restart, since each is baked
+  into something only built once at startup (a bound listener, the
+  negotiated TLS version set, a fixed-size semaphore).
 - There is no built-in HTTP→HTTPS redirect on port 80 — per the task
   description the service only listens on 443. If you need one, run a
   simple separate redirector on port 80 (or use nginx for that) instead.

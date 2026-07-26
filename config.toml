@@ -10,6 +10,12 @@
 # every later bare `key = value` line attaches to the *last* routes entry,
 # not to the top-level document. So all top-level scalar fields below
 # MUST come before the [[routes]] blocks — do not move them after.
+#
+# Sending the running process SIGHUP reloads this file, tls_cert_path/
+# tls_key_path, and static_dir without dropping any connection already
+# in flight (see README.md, "Reloading without a restart"). listen_addr,
+# metrics_addr, tls_min_version, and max_connections are the exception —
+# changing those still needs a full restart.
 # ============================================================================
 
 # Address the front server itself listens on. Port 443 requires either
@@ -46,10 +52,24 @@ tls_min_version = "1.2"
 # and no extra port is opened at all.
 metrics_addr = "127.0.0.1:9090"
 
+# (optional, default 10000) hard cap on connections handled at once,
+# across both routes combined. Once this many connections are in flight,
+# new ones simply queue in the kernel's accept backlog until a slot
+# frees up, instead of being accepted without limit and exhausting file
+# descriptors or memory — the same role nginx's `worker_connections`
+# plays. Must be greater than 0 (enforced at startup). Each proxied
+# connection holds two sockets (client + upstream), so raise this with
+# that in mind if you also raise the process's file descriptor limit.
+max_connections = 10000
+
 # One [[routes]] block per hidden service. If the SNI of an incoming TLS
 # connection matches a route's `sni`, the connection is transparently
 # proxied to that route's `upstream` (no TLS termination on this side).
 # Each `sni` must be unique; both fields are required and may not be empty.
+# `upstream` must look like a valid "host:port" (checked at startup —
+# no "https://" prefix, no trailing path, a real port number); this does
+# NOT resolve hostnames, so a typo'd-but-well-formed hostname is only
+# caught the first time a connection actually tries to use it.
 # NOTE: keep all [[routes]] blocks at the end of the file, after every
 # top-level scalar field above (see the TOML ordering warning at the top).
 [[routes]]
