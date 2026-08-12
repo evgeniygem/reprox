@@ -87,6 +87,8 @@ pub struct Stats {
 
     // --- connections ---
     pub connections: AtomicU64,
+    pub connections_rejected_ip_limit_total: AtomicU64,
+    pub connections_rejected_rate_limit_total: AtomicU64,
     pub connections_proxied_total: AtomicU64,
     pub connections_fallback_total: AtomicU64,
     connections_proxied_completed_total: AtomicU64,
@@ -136,6 +138,8 @@ impl Stats {
         Self {
             start: Instant::now(),
             connections: AtomicU64::new(0),
+            connections_rejected_ip_limit_total: AtomicU64::new(0),
+            connections_rejected_rate_limit_total: AtomicU64::new(0),
             connections_proxied_total: AtomicU64::new(0),
             connections_fallback_total: AtomicU64::new(0),
             connections_proxied_completed_total: AtomicU64::new(0),
@@ -241,6 +245,12 @@ impl Stats {
                 connections_limit: config.max_connections as u64,
                 connections_available: (config.max_connections as u64)
                     .saturating_sub(self.connections.load(Ordering::Relaxed)),
+                ip_limit_total: self
+                    .connections_rejected_ip_limit_total
+                    .load(Ordering::Relaxed),
+                rate_limit_total: self
+                    .connections_rejected_rate_limit_total
+                    .load(Ordering::Relaxed),
             },
             clienthello: ClientHelloSnapshot {
                 sni_present_total: self.sni_present_total.load(Ordering::Relaxed),
@@ -385,6 +395,14 @@ impl Stats {
                 (
                     &[("reason", "closed_early")],
                     Value::U(s.connections.closed_early_total),
+                ),
+                (
+                    &[("reason", "ip_limit")],
+                    Value::U(s.connections.ip_limit_total),
+                ),
+                (
+                    &[("reason", "rate_limit")],
+                    Value::U(s.connections.rate_limit_total),
                 ),
             ],
         );
@@ -622,6 +640,8 @@ struct ConnectionsSnapshot {
     closed_early_total: u64,
     connections_limit: u64,
     connections_available: u64,
+    ip_limit_total: u64,
+    rate_limit_total: u64,
 }
 
 #[derive(Serialize)]

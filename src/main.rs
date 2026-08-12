@@ -1,8 +1,10 @@
 mod config;
 mod http_util;
+mod ip_limiter;
 mod limiter;
 mod metrics;
 mod prefixed_stream;
+mod rate_limiter;
 mod route;
 mod sni;
 mod tls;
@@ -14,8 +16,10 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServiceConfig;
+use crate::ip_limiter::IpLimiter;
 use crate::limiter::ConnectionLimiter;
 use crate::metrics::Stats;
+use crate::rate_limiter::RateLimiter;
 use crate::route::Router;
 use crate::route::fallback::StaticSite;
 
@@ -79,6 +83,11 @@ async fn main() -> anyhow::Result<()> {
     // accept_loop can gate admission on the connection-slot semaphore
     // that also lives on `Stats` (see metrics::Stats::acquire_connection_slot).
     let router = Router::new(acceptor, stats.clone(), site, config.clone());
+    let rate_limiter = RateLimiter::new(
+        config.connection_rate_per_ip.unwrap_or(0.0),
+        config.connection_burst_per_ip.unwrap_or(10),
+    );
+    let ip_limiter = IpLimiter::new(config.max_connections_per_ip.unwrap_or(0));
 
     // Watch for SIGHUP and reload config/routes/static site/TLS
     // certificate on each one — see `hot_reload` for exactly what
@@ -91,8 +100,13 @@ async fn main() -> anyhow::Result<()> {
         let router = router.clone();
         let cert_resolver = cert_resolver.clone();
         let config = config.clone();
+        let ip_limiter = ip_limiter.clone();
+        let rate_limiter = rate_limiter.clone();
+
         tokio::spawn(async move {
-            if let Err(e) = hot_reload(router, cert_resolver, config).await {
+            if let Err(e) =
+                hot_reload(router, cert_resolver, ip_limiter, rate_limiter, config).await
+            {
                 tracing::error!(
                     error = %e,
                     "SIGHUP reload watcher stopped;\
@@ -103,10 +117,23 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // Background task: periodically sweeps stale buckets
+    {
+        let rate_limiter = rate_limiter.clone();
+        tokio::spawn(async move {
+            run_janitor(rate_limiter, Duration::from_secs(300)).await;
+        });
+    }
+
     let conn_limiter = ConnectionLimiter::new(config.max_connections, stats.clone());
 
     tokio::select! {
-        res = accept_loop(listener, router, conn_limiter) => res?,
+        res = accept_loop(listener,
+                          router,
+                          conn_limiter,
+                          ip_limiter,
+                          rate_limiter,
+                          stats.clone()) => res?,
         _ = shutdown_signal() => {}
     }
 
@@ -186,6 +213,8 @@ async fn shutdown_signal() {
 async fn hot_reload(
     router: Router,
     cert_resolver: Arc<tls::ReloadableCertResolver>,
+    ip_limiter: IpLimiter,
+    rate_limiter: RateLimiter,
     mut current_config: Arc<ServiceConfig>,
 ) -> anyhow::Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
@@ -234,8 +263,17 @@ async fn hot_reload(
             }
         };
 
+        // Update states
         cert_resolver.update(certified_key);
         router.reload(new_config.clone());
+
+        ip_limiter.set_limit(new_config.max_connections_per_ip.unwrap_or(0));
+
+        rate_limiter.set_limit(
+            new_config.connection_rate_per_ip.unwrap_or(0.0),
+            new_config.connection_burst_per_ip.unwrap_or(10),
+        );
+
         current_config = new_config;
 
         tracing::info!("reload complete");
@@ -265,6 +303,18 @@ async fn wait_for_drain(stats: &Stats, grace_period: Duration) {
     }
 }
 
+/// Run the janitor to clear the rate limiter's memory. A full buffer is
+/// indistinguishable from an IP address that has never been encountered,
+/// so deleting it does not result in any loss of state.
+async fn run_janitor(rate_limiter: RateLimiter, duration: Duration) {
+    let mut timer = tokio::time::interval(duration);
+
+    loop {
+        timer.tick().await;
+        rate_limiter.sweep();
+    }
+}
+
 /// Accepts connections and hands each one to `router`, bounded by
 /// `stats`'s connection-slot semaphore (`max_connections` in the
 /// config).
@@ -281,9 +331,12 @@ async fn accept_loop(
     listener: TcpListener,
     router: Router,
     connection_limiter: ConnectionLimiter,
+    ip_limiter: IpLimiter,
+    rate_limiter: RateLimiter,
+    stats: Arc<Stats>,
 ) -> anyhow::Result<()> {
     loop {
-        let slot = connection_limiter.acquire_slot().await;
+        let conn_slot = connection_limiter.acquire_slot().await;
 
         let (stream, peer) = match listener.accept().await {
             Ok(pair) => pair,
@@ -298,7 +351,7 @@ async fn accept_loop(
                 // slot we reserved for the connection that didn't
                 // actually materialize, so it doesn't sit wasted until
                 // the next successful accept happens to release one.
-                drop(slot);
+                drop(conn_slot);
                 tracing::warn!(error = %e, "accept() failed; retrying");
                 tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
                 continue;
@@ -306,13 +359,39 @@ async fn accept_loop(
         };
         let _ = stream.set_nodelay(true);
 
+        if !rate_limiter.allow(peer.ip()) {
+            drop(conn_slot); // give the global slot back too
+            tracing::debug!(%peer, "rejected: per-IP connection rate exceeded");
+            stats
+                .connections_rejected_rate_limit_total
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            continue;
+        }
+
+        // Per-IP check happens after accept() (we only learn the peer's
+        // address once the socket exists), but before the connection
+        // task is spawned — a flooding IP gets its socket closed
+        // immediately instead of ever reaching the SNI-probe stage.
+        let ip_slot = match ip_limiter.try_acquire_slot(peer.ip()) {
+            Some(s) => s,
+            None => {
+                drop(conn_slot); // give the global slot back too
+                tracing::debug!(%peer, "rejected: per-IP connection limit reached");
+                stats
+                    .connections_rejected_ip_limit_total
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue; // `stream` drops here, closing the socket
+            }
+        };
+
         let router = router.clone();
 
         tokio::spawn(async move {
             // Held for as long as the spawned task runs; dropped (and
             // the slot released back to the pool) whenever it ends, via
             // any path — normal completion, early return, or panic.
-            let _slot = slot;
+            let _conn_slot = conn_slot;
+            let _ip_slot = ip_slot;
             if let Err(e) = router.route(stream, peer).await {
                 tracing::debug!(%peer, error = %e, "connection ended with an error");
             }

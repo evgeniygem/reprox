@@ -112,7 +112,12 @@ use the exact versions you tested against.
       connection holds two sockets (client + upstream), so raise this
       with that in mind if you're also tuning the process's file
       descriptor limit (`ulimit -n` / `LimitNOFILE=` in the systemd
-      unit).
+      unit). See "Per-IP connection limits" below for capping how much
+      of that budget a single IP can take.
+    - `max_connections_per_ip` - (optional) hard cap on concurrent
+      connections from a single client IP, enforced in addition to
+      max_connections. Bounds how many connections a single client IP
+      may have open at once.
 2. Replace the placeholders in `static/` (company name, e-mail, the
    domain in `robots.txt`) with your own — if several operators use
    this template verbatim and unmodified, the sites become easy to
@@ -143,6 +148,50 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now reprox
 ```
 
+### Per-IP connection limits
+
+`max_connections` caps how many connections the whole process handles
+at once, but says nothing about a *single* IP — one peer could still
+open thousands of slow-drip connections (each just sitting in the
+SNI-probe phase until `handshake_timeout_secs`) and starve every other
+visitor out of the global cap. Two independent, opt-in limits guard
+against that, both keyed by the client's IP address:
+
+- `max_connections_per_ip` (optional, unset = disabled) — hard cap on
+  how many connections a single IP may have **open at once**. Guards
+  against one IP occupying an outsized share of `max_connections` just
+  by holding sockets open.
+- `connection_rate_per_ip` / `connection_burst_per_ip` (optional,
+  unset = disabled) — a token-bucket cap on how fast a single IP may
+  **open new connections**: `connection_rate_per_ip` connections/sec
+  sustained, `connection_burst_per_ip` allowed back-to-back before
+  throttling kicks in (defaults to `10` if a rate is set but a burst
+  isn't). Guards against a fast scanner that never keeps enough
+  connections open at once to trip the limit above.
+
+```toml
+max_connections_per_ip = 100
+connection_rate_per_ip = 5
+connection_burst_per_ip = 20
+```
+
+Both apply only to the public listener — loopback addresses (local
+health checks, metrics scraping) are never throttled by either one.
+Rejections show up in `reprox_connections_rejected_total` as
+`reason="ip_limit"` and `reason="rate_limit"` respectively (see
+Metrics below); a sustained non-zero rate there, separate from the
+ordinary SNI-probe noise, is a good early signal of scanning or
+abusive traffic worth looking into. Unlike `max_connections`, both of
+these settings **are** picked up live by `SIGHUP` — see "Reloading
+without a restart".
+
+These limits key strictly on the TCP peer address. If `reprox` sits
+behind something that already terminates/re-originates connections
+(another load balancer, a CDN) every client will appear to share that
+upstream's IP — either enable PROXY protocol upstream of `reprox` (not
+currently supported) or apply IP-based limiting at whatever layer
+actually sees the real client addresses instead.
+
 ## Metrics &amp; internal API
 
 If `metrics_addr` is set in the config (it must be a loopback address —
@@ -164,25 +213,25 @@ Everything below is tracked in-memory (reset on restart, not persisted)
 and, other than the active-connection gauges, is monotonically
 increasing — suitable for `rate()`/`increase()` in Prometheus.
 
-| Metric                                         | Type    | Labels                                               | What it tells you                                                                                                                                                                                                              |
-|------------------------------------------------|---------|------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `reprox_uptime_seconds`                        | gauge   | —                                                    | Time since the process started.                                                                                                                                                                                                |
-| `reprox_connections_total`                     | counter | `route=proxied\|fallback`                            | TCP connections accepted, by route.                                                                                                                                                                                            |
-| `reprox_connections_active`                    | gauge   | `route=proxied\|fallback`                            | Connections currently being served.                                                                                                                                                                                            |
-| `reprox_connection_duration_ms_sum` / `_count` | counter | `route=proxied\|fallback`                            | Sum/count of completed connections — divide for the average duration per route.                                                                                                                                                |
-| `reprox_connections_rejected_total`            | counter | `reason=probe_timeout\|probe_io_error\|closed_early` | Connections that never produced a usable ClientHello.                                                                                                                                                                          |
-| `reprox_connections_limit`                     | gauge   | —                                                    | Configured `max_connections` cap on connections handled at once, across both routes.                                                                                                                                           |
-| `reprox_connections_available`                 | gauge   | —                                                    | Free connection slots out of `reprox_connections_limit` right now. A sustained `0` means `max_connections` is the current bottleneck — new connections are queuing instead of being served.                                    |
-| `reprox_clienthello_total`                     | counter | `result=sni_present\|sni_absent\|not_tls`            | ClientHello classification — `not_tls` spiking is a useful signal for scanning/probing traffic.                                                                                                                                |
-| `reprox_proxy_bytes_total`                     | counter | `direction=client_to_service\|service_to_client`     | Bytes relayed between clients and service.                                                                                                                                                                                     |
-| `reprox_proxy_service_connect_failures_total`  | counter | —                                                    | Connections that couldn't reach service after exhausting connect retries (see below) — a non-zero rate usually means service is down or misconfigured.                                                                         |
-| `reprox_proxy_service_connect_retries_total`   | counter | —                                                    | Failed connect attempts to service that were retried with backoff (excludes each route's final, giving-up attempt). High relative to the failures counter above means service is usually just briefly slow, not actually down. |
-| `reprox_tls_handshakes_total`                  | counter | `result=success\|failure`                            | Fallback-path TLS handshake outcomes.                                                                                                                                                                                          |
-| `reprox_alpn_selected_total`                   | counter | `protocol=h2\|http1\|none`                           | Negotiated ALPN protocol on the fallback path.                                                                                                                                                                                 |
-| `reprox_http_requests_total`                   | counter | `method=GET\|HEAD\|OPTIONS\|other`                   | Fallback-site requests by method.                                                                                                                                                                                              |
-| `reprox_http_responses_total`                  | counter | `status=200\|204\|304\|404\|405\|other`              | Fallback-site responses by status code.                                                                                                                                                                                        |
-| `reprox_http_response_bytes_total`             | counter | —                                                    | Approximate response body bytes sent (from `Content-Length`).                                                                                                                                                                  |
-| `reprox_config_secret_domains`                 | gauge   | —                                                    | Number of configured `routes` entries (kept under its original name for dashboard/alert compatibility) — a quick sanity check that config loaded correctly after a restart or a SIGHUP reload.                                 |
+| Metric                                         | Type    | Labels                                                                     | What it tells you                                                                                                                                                                                                              |
+|------------------------------------------------|---------|----------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `reprox_uptime_seconds`                        | gauge   | —                                                                          | Time since the process started.                                                                                                                                                                                                |
+| `reprox_connections_total`                     | counter | `route=proxied\|fallback`                                                  | TCP connections accepted, by route.                                                                                                                                                                                            |
+| `reprox_connections_active`                    | gauge   | `route=proxied\|fallback`                                                  | Connections currently being served.                                                                                                                                                                                            |
+| `reprox_connection_duration_ms_sum` / `_count` | counter | `route=proxied\|fallback`                                                  | Sum/count of completed connections — divide for the average duration per route.                                                                                                                                                |
+| `reprox_connections_rejected_total`            | counter | `reason=probe_timeout\|probe_io_error\|closed_early\|ip_limit\|rate_limit` | Connections rejected before ever being routed. `probe_timeout`/`probe_io_error`/`closed_early` are SNI-probe outcomes; `ip_limit`/`rate_limit` are per-IP limiter rejections (see "Per-IP connection limits").                 |
+| `reprox_connections_limit`                     | gauge   | —                                                                          | Configured `max_connections` cap on connections handled at once, across both routes.                                                                                                                                           |
+| `reprox_connections_available`                 | gauge   | —                                                                          | Free connection slots out of `reprox_connections_limit` right now. A sustained `0` means `max_connections` is the current bottleneck — new connections are queuing instead of being served.                                    |
+| `reprox_clienthello_total`                     | counter | `result=sni_present\|sni_absent\|not_tls`                                  | ClientHello classification — `not_tls` spiking is a useful signal for scanning/probing traffic.                                                                                                                                |
+| `reprox_proxy_bytes_total`                     | counter | `direction=client_to_service\|service_to_client`                           | Bytes relayed between clients and service.                                                                                                                                                                                     |
+| `reprox_proxy_service_connect_failures_total`  | counter | —                                                                          | Connections that couldn't reach service after exhausting connect retries (see below) — a non-zero rate usually means service is down or misconfigured.                                                                         |
+| `reprox_proxy_service_connect_retries_total`   | counter | —                                                                          | Failed connect attempts to service that were retried with backoff (excludes each route's final, giving-up attempt). High relative to the failures counter above means service is usually just briefly slow, not actually down. |
+| `reprox_tls_handshakes_total`                  | counter | `result=success\|failure`                                                  | Fallback-path TLS handshake outcomes.                                                                                                                                                                                          |
+| `reprox_alpn_selected_total`                   | counter | `protocol=h2\|http1\|none`                                                 | Negotiated ALPN protocol on the fallback path.                                                                                                                                                                                 |
+| `reprox_http_requests_total`                   | counter | `method=GET\|HEAD\|OPTIONS\|other`                                         | Fallback-site requests by method.                                                                                                                                                                                              |
+| `reprox_http_responses_total`                  | counter | `status=200\|204\|304\|404\|405\|other`                                    | Fallback-site responses by status code.                                                                                                                                                                                        |
+| `reprox_http_response_bytes_total`             | counter | —                                                                          | Approximate response body bytes sent (from `Content-Length`).                                                                                                                                                                  |
+| `reprox_config_secret_domains`                 | gauge   | —                                                                          | Number of configured `routes` entries (kept under its original name for dashboard/alert compatibility) — a quick sanity check that config loaded correctly after a restart or a SIGHUP reload.                                 |
 
 Sample check after enabling `metrics_addr = "127.0.0.1:9090"`:
 
@@ -203,19 +252,22 @@ outright.
 
 ## Environment variables (override config.toml)
 
-| Variable                        | Corresponding field                    |
-|---------------------------------|----------------------------------------|
-| `REPROX_CONFIG`                 | path to the TOML file itself           |
-| `REPROX_LISTEN_ADDR`            | `listen_addr`                          |
-| `REPROX_TLS_CERT_PATH`          | `tls_cert_path`                        |
-| `REPROX_TLS_KEY_PATH`           | `tls_key_path`                         |
-| `REPROX_STATIC_DIR`             | `static_dir`                           |
-| `REPROX_SERVER_HEADER`          | `server_header`                        |
-| `REPROX_HANDSHAKE_TIMEOUT_SECS` | `handshake_timeout_secs`               |
-| `REPROX_TLS_MIN_VERSION`        | `tls_min_version`                      |
-| `REPROX_METRICS_ADDR`           | `metrics_addr`                         |
-| `REPROX_MAX_CONNECTIONS`        | `max_connections`                      |
-| `RUST_LOG`                      | tracing log level (defaults to `info`) |
+| Variable                         | Corresponding field                    |
+|----------------------------------|----------------------------------------|
+| `REPROX_CONFIG`                  | path to the TOML file itself           |
+| `REPROX_LISTEN_ADDR`             | `listen_addr`                          |
+| `REPROX_TLS_CERT_PATH`           | `tls_cert_path`                        |
+| `REPROX_TLS_KEY_PATH`            | `tls_key_path`                         |
+| `REPROX_STATIC_DIR`              | `static_dir`                           |
+| `REPROX_SERVER_HEADER`           | `server_header`                        |
+| `REPROX_HANDSHAKE_TIMEOUT_SECS`  | `handshake_timeout_secs`               |
+| `REPROX_TLS_MIN_VERSION`         | `tls_min_version`                      |
+| `REPROX_METRICS_ADDR`            | `metrics_addr`                         |
+| `REPROX_MAX_CONNECTIONS`         | `max_connections`                      |
+| `REPROX_MAX_CONNECTIONS_PER_IP`  | `max_connections_per_ip`               |
+| `REPROX_CONNECTION_RATE_PER_IP`  | `connection_rate_per_ip`               |
+| `REPROX_CONNECTION_BURST_PER_IP` | `connection_burst_per_ip`              |
+| `RUST_LOG`                       | tracing log level (defaults to `info`) |
 
 ## Verifying after deployment
 
@@ -267,8 +319,8 @@ application-level handling can intercept.
 ## Reloading without a restart
 
 Send `SIGHUP` to reload `config.toml`, the `routes` table, the TLS
-certificate/key, and the static site — all without dropping a single
-in-flight connection:
+certificate/key, the static site, and the per-IP connection/rate
+limits — all without dropping a single in-flight connection:
 
 ```
 sudo systemctl reload reprox     # if your unit sets ExecReload, see below
@@ -295,7 +347,11 @@ something the process only builds once at startup (a bound listener, the
 `rustls::ServerConfig`'s negotiated TLS version set, a fixed-size
 connection-slot semaphore); changing one of these in `config.toml` and
 sending SIGHUP logs a warning telling you a restart is needed, rather
-than silently doing nothing or half-applying it.
+than silently doing nothing or half-applying it. `max_connections_per_ip`,
+`connection_rate_per_ip`, and `connection_burst_per_ip` are deliberately
+*not* in this list — neither per-IP limiter is backed by a fixed-size
+structure (just a threshold checked on each connection), so both apply
+immediately on the next SIGHUP.
 
 If your systemd unit doesn't already have one, add an `ExecReload` line
 so `systemctl reload` works as shown above:
@@ -323,3 +379,9 @@ ExecReload=/bin/kill -HUP $MAINPID
 - There is no built-in HTTP→HTTPS redirect on port 80 — per the task
   description the service only listens on 443. If you need one, run a
   simple separate redirector on port 80 (or use nginx for that) instead.
+- The optional `max_connections_per_ip` and `connection_rate_per_ip`
+  limits (see "Per-IP connection limits") key on the raw TCP peer
+  address. Behind a load balancer or CDN that already re-originates
+  connections, every client looks like it shares that upstream's IP —
+  these limits are only meaningful when `reprox` sees real client IPs
+  directly.

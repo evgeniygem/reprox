@@ -60,6 +60,26 @@ pub struct ServiceConfig {
     /// queue until a slot frees up.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
+
+    /// Optional hard cap on concurrent connections from a single client
+    /// IP, enforced in addition to `max_connections`. Unlike
+    /// `max_connections`, this one *is* picked up live by SIGHUP — see
+    /// `ip_limiter::PerIpLimiter::set_max_per_ip`. Unset or `0` disables it.
+    #[serde(default)]
+    pub max_connections_per_ip: Option<usize>,
+
+    /// Sustained new-connections/sec allowed from a single client IP
+    /// (token-bucket, complements `max_connections_per_ip`). Unset or
+    /// `0` disables it. Reloadable live via SIGHUP.
+    #[serde(default)]
+    pub connection_rate_per_ip: Option<f64>,
+
+    /// Burst size for `connection_rate_per_ip` — how many connections
+    /// an IP may open back-to-back before throttling kicks in.
+    /// Ignored if `connection_rate_per_ip` is unset. Defaults to `10`
+    /// when the rate is set but burst isn't.
+    #[serde(default)]
+    pub connection_burst_per_ip: Option<u64>,
 }
 
 /// A single `[[routes]]` entry from the config file: maps one SNI value
@@ -176,6 +196,24 @@ impl ServiceConfig {
         {
             self.max_connections = n;
         }
+
+        if let Ok(v) = std::env::var("REPROX_MAX_CONNECTIONS_PER_IP")
+            && let Ok(n) = v.parse()
+        {
+            self.max_connections_per_ip = Some(n);
+        }
+
+        if let Ok(v) = std::env::var("REPROX_CONNECTION_RATE_PER_IP")
+            && let Ok(n) = v.parse()
+        {
+            self.connection_rate_per_ip = Some(n);
+        }
+
+        if let Ok(v) = std::env::var("REPROX_CONNECTION_BURST_PER_IP")
+            && let Ok(n) = v.parse()
+        {
+            self.connection_burst_per_ip = Some(n);
+        }
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -228,9 +266,22 @@ impl ServiceConfig {
         {
             anyhow::bail!("metrics_addr must be a loopback address (127.0.0.1/::1), got {addr}");
         }
+
         if self.max_connections == 0 {
             anyhow::bail!("max_connections must be greater than 0");
         }
+
+        if let Some(rate) = self.connection_rate_per_ip {
+            anyhow::ensure!(
+                rate.is_finite() && rate > 0.0,
+                "connection_rate_per_ip must be positive"
+            );
+        }
+
+        if let Some(burst) = self.connection_burst_per_ip {
+            anyhow::ensure!(burst >= 1, "connection_burst_per_ip must be at least 1");
+        }
+
         Ok(())
     }
 
