@@ -89,8 +89,8 @@ async fn main() -> anyhow::Result<()> {
     );
     let ip_limiter = IpLimiter::new(config.max_connections_per_ip.unwrap_or(0));
 
-    // Watch for SIGHUP and reload config/routes/static site/TLS
-    // certificate on each one — see `hot_reload` for exactly what
+    // Watch for SIGHUP and reload config/routes/TLS certificate on
+    // each one — see `hot_reload` for exactly what
     // is and isn't picked up live. Unix-only (SIGHUP has no Windows
     // equivalent), matching this project's systemd/Linux deployment
     // target; on other platforms this simply isn't spawned, and the
@@ -187,28 +187,29 @@ async fn shutdown_signal() {
 }
 
 /// Watches for SIGHUP and, on each one, reloads `config.toml`, the
-/// `routes` table, the in-memory static site, and the TLS certificate/
-/// key — all without dropping a single in-flight connection: an
-/// existing connection keeps running against whatever state it already
-/// snapshotted (`route::Router::route` takes its own snapshot at the
-/// very start of each connection), so a reload only affects connections
-/// accepted afterwards.
+/// `routes` table, and the TLS certificate/key — all without dropping a
+/// single in-flight connection: an existing connection keeps running
+/// against whatever state it already snapshotted (`route::Router::route`
+/// takes its own snapshot at the very start of each connection), so a
+/// reload only affects connections accepted afterwards.
 ///
 /// What does **not** take effect from a SIGHUP reload: `listen_addr`,
-/// `metrics_addr`, `tls_min_version`, and `max_connections`. Each of
-/// those is baked into something created once at startup — a bound
-/// listener, a `rustls::ServerConfig`'s negotiated cipher/version set,
-/// or a fixed-size semaphore — and none of those get rebuilt here.
-/// Changing one of these in `config.toml` and sending SIGHUP logs a
-/// warning (`ServiceConfig::warn_about_unreloadable_changes`) instead of
+/// `metrics_addr`, `tls_min_version`, `max_connections`, and
+/// `static_dir`. Each of those is baked into something created once at
+/// startup — a bound listener, a `rustls::ServerConfig`'s negotiated
+/// cipher/version set, a fixed-size semaphore, or (for `static_dir`)
+/// the in-memory static site built once in `main` and handed to
+/// `Router::new` — and none of those get rebuilt here. Changing one of
+/// these in `config.toml` and sending SIGHUP logs a warning
+/// (`ServiceConfig::warn_about_unreloadable_changes`) instead of
 /// silently doing nothing, but a full restart is still required to
 /// actually apply it.
 ///
-/// A reload that fails partway through (bad TOML, a missing, invalid,
-/// or mismatched cert/key, an unloadable static site) is logged and
-/// otherwise ignored: the process keeps running on whatever
-/// configuration it already had, rather than crashing or ending up in a
-/// half-applied mix of old and new state.
+/// A reload that fails partway through (bad TOML, or a missing,
+/// invalid, or mismatched cert/key) is logged and otherwise ignored:
+/// the process keeps running on whatever configuration it already had,
+/// rather than crashing or ending up in a half-applied mix of old and
+/// new state.
 #[cfg(unix)]
 async fn hot_reload(
     router: Router,
@@ -230,9 +231,7 @@ async fn hot_reload(
             return Ok(());
         }
 
-        tracing::info!(
-            "SIGHUP received — reloading config, routes, static site, and TLS certificate"
-        );
+        tracing::info!("SIGHUP received — reloading config, routes, and TLS certificate");
 
         let new_config = match ServiceConfig::try_load().await {
             Ok(c) => Arc::new(c),

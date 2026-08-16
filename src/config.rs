@@ -19,8 +19,10 @@ pub struct ServiceConfig {
     pub listen_addr: SocketAddr,
 
     /// Proxy targets. If the SNI of an incoming TLS connection matches one of these,
-    /// the connection is transparently proxied to upstream with no TLS termination on
-    /// this side.
+    /// the connection is proxied to that route's `upstream`. By default (see
+    /// `ProxyTarget::tls_passthrough`) this is fully transparent, with no TLS
+    /// termination on this side; a route may opt out of that and have `reprox`
+    /// terminate TLS itself instead, handing `upstream` the decrypted plaintext.
     pub routes: Vec<ProxyTarget>,
 
     /// Path to the certificate (full chain, PEM) for the fallback site.
@@ -97,6 +99,22 @@ pub struct ProxyTarget {
     /// IP:port pair or a resolvable hostname:port, since it is passed
     /// directly to `TcpStream::connect`.
     pub upstream: String,
+
+    /// Whether this route's traffic bypasses TLS entirely on this side.
+    ///
+    /// `true` (the default): classic FakeTLS behavior — the raw TCP stream
+    /// (including the already-read ClientHello bytes) is forwarded to
+    /// `upstream` byte-for-byte, and `upstream` performs its own TLS
+    /// handshake with the client. `reprox` never sees plaintext.
+    ///
+    /// `false`: `reprox` terminates the TLS connection itself, using the
+    /// same certificate/`TlsAcceptor` as the fallback site (see
+    /// `route::proxy::proxy_with_tls_termination`), then opens a *new*,
+    /// unencrypted TCP connection to `upstream` and relays the decrypted
+    /// bytes both ways. Use this when the hidden service expects plain,
+    /// unencrypted traffic rather than speaking TLS itself.
+    #[serde(default = "default_tls_passthrough")]
+    pub tls_passthrough: bool,
 }
 
 /// Default `Server` header when `server_header` is omitted from the
@@ -127,6 +145,14 @@ fn default_tls_min_version() -> String {
 /// usage on that route is bounded to roughly 2x this value.
 fn default_max_connections() -> usize {
     10_000
+}
+
+/// Default for `tls_passthrough` when a `[[routes]]` entry omits it:
+/// `true`, i.e. raw TLS passthrough — this matches `reprox`'s original,
+/// only behavior, so existing `config.toml` files without this field
+/// keep working unchanged.
+fn default_tls_passthrough() -> bool {
+    true
 }
 
 impl ServiceConfig {
@@ -322,6 +348,14 @@ impl ServiceConfig {
                 new = new.max_connections,
                 "max_connections changed in config.toml, but SIGHUP can't resize \
                 the connection-slot limiter — restart the process to apply this"
+            );
+        }
+        if self.static_dir != new.static_dir {
+            tracing::warn!(
+                old = ?self.static_dir,
+                new = ?new.static_dir,
+                "static_dir changed in config.toml, but SIGHUP doesn't reload \
+                the in-memory static site — restart the process to apply this"
             );
         }
     }

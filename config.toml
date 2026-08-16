@@ -11,10 +11,11 @@
 # not to the top-level document. So all top-level scalar fields below
 # MUST come before the [[routes]] blocks — do not move them after.
 #
-# Sending the running process SIGHUP reloads this file, tls_cert_path/
-# tls_key_path, and static_dir without dropping any connection already
-# in flight (see README.md, "Reloading without a restart"). listen_addr,
-# metrics_addr, tls_min_version, and max_connections are the exception —
+# Sending the running process SIGHUP reloads this file, routes,
+# tls_cert_path/tls_key_path, and the per-IP connection/rate limits
+# without dropping any connection already in flight (see README.md,
+# "Reloading without a restart"). listen_addr, metrics_addr,
+# tls_min_version, max_connections, and static_dir are the exception —
 # changing those still needs a full restart.
 # ============================================================================
 
@@ -63,19 +64,33 @@ metrics_addr = "127.0.0.1:9090"
 max_connections = 10000
 
 # One [[routes]] block per hidden service. If the SNI of an incoming TLS
-# connection matches a route's `sni`, the connection is transparently
-# proxied to that route's `upstream` (no TLS termination on this side).
-# Each `sni` must be unique; both fields are required and may not be empty.
+# connection matches a route's `sni`, the connection is proxied to that
+# route's `upstream`. Each `sni` must be unique; `sni` and `upstream` are
+# required and may not be empty.
 # `upstream` must look like a valid "host:port" (checked at startup —
 # no "https://" prefix, no trailing path, a real port number); this does
 # NOT resolve hostnames, so a typo'd-but-well-formed hostname is only
 # caught the first time a connection actually tries to use it.
+# `tls_passthrough` (optional, default true) controls whether TLS is
+# terminated on this side:
+#   true  — classic FakeTLS: the raw TCP/TLS bytes are forwarded to
+#           `upstream` untouched; `upstream` performs its own handshake.
+#   false — `reprox` terminates TLS itself (same certificate as the
+#           fallback site) and forwards the decrypted plaintext to
+#           `upstream` over a new, unencrypted TCP connection. Use this
+#           when the hidden service expects plain traffic rather than
+#           speaking TLS itself.
 # NOTE: keep all [[routes]] blocks at the end of the file, after every
 # top-level scalar field above (see the TOML ordering warning at the top).
+
+# Passthrough (default): domain.com's upstream does its own TLS.
 [[routes]]
 sni = "domain.com"
 upstream = "127.0.0.1:8080"
 
+# TLS termination: reprox decrypts for api.domain.com and hands
+# 127.0.0.1:4443 plain, unencrypted traffic.
 [[routes]]
 sni = "api.domain.com"
 upstream = "127.0.0.1:4443"
+tls_passthrough = false

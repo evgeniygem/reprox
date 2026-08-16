@@ -31,7 +31,7 @@ use tokio::net::TcpStream;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 
-use super::proxy::proxy;
+use super::proxy::{proxy, proxy_with_tls_termination};
 use super::serve::serve;
 use crate::config::{ProxyTarget, ServiceConfig};
 use crate::metrics::Stats;
@@ -204,7 +204,25 @@ impl Router {
             Some(target) => {
                 tracing::debug!(%peer, sni = ?sni_host, "SNI matched the secret domain — proxying to service");
                 let _active = self.inner.stats.begin_proxied();
-                proxy(stream, prefix, &target.upstream, stats).await
+
+                // Per-route choice (see `config::ProxyTarget::tls_passthrough`):
+                // by default the raw TLS bytes are forwarded untouched and
+                // service handles its own handshake; a route can opt out
+                // and have `reprox` terminate TLS here instead, handing
+                // `upstream` plaintext.
+                if target.tls_passthrough {
+                    proxy(stream, prefix, &target.upstream, stats).await
+                } else {
+                    proxy_with_tls_termination(
+                        stream,
+                        prefix,
+                        self.inner.acceptor.clone(),
+                        &target.upstream,
+                        state.config.clone(),
+                        stats,
+                    )
+                    .await
+                }
             }
             None => {
                 tracing::debug!(%peer, sni = ?sni_host, "SNI did not match — serving the fallback site");

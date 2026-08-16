@@ -1,14 +1,23 @@
-//! Transparent TCP proxying to the local service instance.
+//! TCP proxying to the local service instance.
 //!
-//! There is nothing TLS-specific here, and there shouldn't be: service
-//! implements the handshake itself and is responsible for TLS
-//! record sizing — we only forward bytes in both directions, starting
-//! with the prefix already read during SNI sniffing (otherwise service
-//! would see a ClientHello missing its first few bytes and couldn't
-//! carry out its own handshake). Byte counters and connect-failure
-//! counts are recorded into `Stats` along the way; connection count,
-//! active-connection gauge, and duration are handled by the
-//! `ActiveGuard` the caller holds for the lifetime of the connection.
+//! Two variants live here, selected per-route by `ProxyTarget::tls_passthrough`
+//! (see `route::router`):
+//!
+//! - `proxy` — the default, and there is nothing TLS-specific about it:
+//!   service implements the handshake itself and is responsible for TLS
+//!   record sizing — we only forward bytes in both directions, starting
+//!   with the prefix already read during SNI sniffing (otherwise service
+//!   would see a ClientHello missing its first few bytes and couldn't
+//!   carry out its own handshake).
+//! - `proxy_with_tls_termination` — for routes that opt out of passthrough:
+//!   `reprox` terminates TLS itself (same certificate/`TlsAcceptor` as the
+//!   fallback site) and relays the decrypted plaintext to `upstream` over a
+//!   new, unencrypted TCP connection.
+//!
+//! Byte counters and connect-failure counts are recorded into `Stats` along
+//! the way; connection count, active-connection gauge, and duration are
+//! handled by the `ActiveGuard` the caller holds for the lifetime of the
+//! connection.
 //!
 //! Connecting to the upstream service goes through `connect_with_backoff`:
 //! a bounded number of attempts, each with its own timeout, with an
@@ -26,13 +35,15 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use crate::config::ServiceConfig;
+use crate::metrics::Stats;
+use crate::prefixed_stream::PrefixedStream;
 use anyhow::Context;
 use bytes::Bytes;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-
-use crate::metrics::Stats;
+use tokio_rustls::TlsAcceptor;
 
 /// How `connect_with_backoff` retries a failed or stalled connect to the
 /// upstream service.
@@ -164,12 +175,15 @@ async fn connect_with_backoff(
     .await
 }
 
-pub async fn proxy(
-    mut client: TcpStream,
-    prefix: Bytes,
+async fn relay_to_service<S>(
+    stream: &mut S,
+    prefix: Option<Bytes>,
     endpoint: &str,
     stats: Arc<Stats>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<()>
+where
+    S: AsyncWrite + AsyncRead + Unpin,
+{
     let mut upstream =
         match connect_with_backoff(endpoint, &ConnectRetryPolicy::DEFAULT, &stats).await {
             Ok(s) => s,
@@ -187,9 +201,11 @@ pub async fn proxy(
         };
     let _ = upstream.set_nodelay(true);
 
-    if !prefix.is_empty() {
+    if let Some(prefix) = prefix.as_ref()
+        && !prefix.is_empty()
+    {
         upstream
-            .write_all(&prefix)
+            .write_all(prefix)
             .await
             .context("failed to forward the buffered ClientHello to service")?;
         stats
@@ -197,7 +213,7 @@ pub async fn proxy(
             .fetch_add(prefix.len() as u64, Ordering::Relaxed);
     }
 
-    match tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
+    match tokio::io::copy_bidirectional(stream, &mut upstream).await {
         Ok((from_client, from_upstream)) => {
             stats
                 .proxy_bytes_client_to_service_total
@@ -215,6 +231,60 @@ pub async fn proxy(
     }
 
     Ok(())
+}
+
+pub async fn proxy(
+    mut client: TcpStream,
+    prefix: Bytes,
+    endpoint: &str,
+    stats: Arc<Stats>,
+) -> anyhow::Result<()> {
+    relay_to_service(&mut client, Some(prefix), endpoint, stats).await
+}
+
+/// Like `proxy`, but for a route with `tls_passthrough = false`: instead of
+/// forwarding the raw TLS bytes untouched, `reprox` terminates the TLS
+/// connection itself — reusing the same certificate/`TlsAcceptor` as the
+/// fallback site (`route::serve::serve`) — and relays the *decrypted*
+/// plaintext to `endpoint` over a new, unencrypted TCP connection.
+///
+/// `prefix` is the ClientHello bytes already read during SNI sniffing;
+/// it's replayed into the TLS handshake via `PrefixedStream`, exactly as
+/// `serve` does for the fallback path, so no byte of the handshake is
+/// lost. The handshake itself, ALPN bookkeeping, and connect-with-backoff
+/// to `endpoint` all mirror `serve`/`proxy` respectively — see those for
+/// the reasoning behind each step.
+pub async fn proxy_with_tls_termination(
+    stream: TcpStream,
+    prefix: Bytes,
+    acceptor: TlsAcceptor,
+    endpoint: &str,
+    config: Arc<ServiceConfig>,
+    stats: Arc<Stats>,
+) -> anyhow::Result<()> {
+    let io = PrefixedStream::new(prefix, stream);
+    let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
+
+    let mut tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
+            // Invalid ClientHello, unsupported TLS version, etc. rustls
+            // itself sends a proper TLS alert wherever the protocol calls
+            // for one; after the error we just close the connection —
+            // with no forced RST (there is no SO_LINGER(0) anywhere in
+            // this project).
+            tracing::debug!(error = %e, "proxy TLS handshake failed");
+            return Ok(());
+        }
+        Err(_) => {
+            // Slowloris-style stall: the client never finished the TLS
+            // handshake within handshake_timeout_secs.
+            tracing::debug!("proxy TLS handshake timed out");
+            return Ok(());
+        }
+    };
+
+    relay_to_service(&mut tls_stream, None, endpoint, stats).await
 }
 
 #[cfg(test)]

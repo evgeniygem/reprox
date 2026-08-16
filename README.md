@@ -4,16 +4,18 @@ An SNI router in front of service, built on the same principle
 as `nginx` + `ssl_preread`:
 
 - If the SNI of an incoming TLS connection matches service's
-  secret domain, TLS is **not terminated** — the whole TCP stream
-  (including the already-read ClientHello bytes) is transparently
-  proxied to the local service instance.
+  secret domain, by default TLS is **not terminated** — the whole TCP
+  stream (including the already-read ClientHello bytes) is transparently
+  proxied to the local service instance. A route can opt out of this
+  (`tls_passthrough = false`) and have `reprox` terminate TLS itself
+  instead, handing the service plaintext.
 - Otherwise (SNI doesn't match, is absent, or the handshake doesn't
   even look like TLS), the server performs a full TLS handshake itself
   on the real certificate and serves a static fallback site over HTTPS.
 
-The connection is never dropped between these two steps: the bytes read
-while determining the SNI are never lost — they get "replayed" either
-into the service upstream or into the TLS acceptor.
+The connection is never dropped between these steps: the bytes read
+while determining the SNI are never lost — they get "replayed" into
+whichever of these three paths ends up handling the connection.
 
 ## How it works
 
@@ -27,9 +29,10 @@ into the service upstream or into the TLS acceptor.
    close the connection itself.
 3. The bytes that were read (`prefix`) are returned either way — they
    are still needed.
-4. If the SNI matches one of the configured `routes` entries,
-   `route::proxy` opens a connection to that route's `upstream` (retrying
-   up to 3 times with exponential backoff — 200ms, 400ms, 800ms between
+4. If the SNI matches one of the configured `routes` entries and that
+   route uses the default `tls_passthrough = true`, `route::proxy`
+   opens a connection to that route's `upstream` (retrying up to 3
+   times with exponential backoff — 200ms, 400ms, 800ms between
    attempts, each capped at a 3s timeout — if the service is briefly
    unreachable, e.g. mid-restart), sends it `prefix`, and then shuttles
    bytes in both directions via `tokio::io::copy_bidirectional`. The
@@ -37,7 +40,13 @@ into the service upstream or into the TLS acceptor.
    not a single byte of the FakeTLS handshake is altered or lost.
    `routes` is a list, so a single `reprox` instance can front more than
    one hidden service, each behind its own SNI.
-5. Otherwise, `route::serve` wraps the socket in a
+5. If the matched route instead sets `tls_passthrough = false`,
+   `route::proxy::proxy_with_tls_termination` terminates TLS on this
+   side — reusing the same certificate/`TlsAcceptor` as the fallback
+   site below — and relays the *decrypted* plaintext to `upstream` over
+   a new, unencrypted TCP connection. Use this for a hidden service that
+   expects plain traffic rather than doing its own TLS.
+6. Otherwise (no route matched), `route::serve` wraps the socket in a
    `PrefixedStream` (first hands out `prefix`, then reads from the real
    socket) and passes it to `tokio_rustls::TlsAcceptor`. After a
    successful handshake, ALPN picks HTTP/2 or HTTP/1.1, and hyper serves
@@ -46,13 +55,16 @@ into the service upstream or into the TLS acceptor.
 
 Every step above updates counters/gauges in `metrics.rs` — connection
 counts and routing decisions in `main.rs`, byte counts and connect
-failures in `proxy.rs`, TLS/ALPN/HTTP outcomes in `serve.rs` — which
-are then exposed over the internal, loopback-only API described below.
+failures in `proxy.rs`, TLS/ALPN outcomes in both `proxy.rs` (for
+`tls_passthrough = false` routes) and `serve.rs`, and HTTP outcomes in
+`serve.rs` — which are then exposed over the internal, loopback-only
+API described below.
 
 This is exactly how a real `nginx` behaves with `stream { ssl_preread
 on; }` + a `map` on `$ssl_preread_server_name` to `proxy_pass`/`return
 444` in one block, and a full `server { listen 443 ssl; }` in
-another — except here it's two code paths in one process on one port.
+another — except here it's up to three code paths in one process on one
+port (plain passthrough, TLS-terminating proxy, and the fallback site).
 
 ## Building
 
@@ -75,6 +87,14 @@ use the exact versions you tested against.
         - `sni` — the secret domain for that service.
         - `upstream` — where that service actually listens (usually
           `127.0.0.1:PORT`).
+        - `tls_passthrough` (optional, default `true`) — `true` is
+          classic FakeTLS: the raw TLS bytes are forwarded to `upstream`
+          untouched and it performs its own handshake. Set it to `false`
+          to have `reprox` terminate TLS itself instead (reusing the
+          same certificate as the fallback site) and forward the
+          *decrypted* plaintext to `upstream` over a new TCP
+          connection — use this when the hidden service expects plain,
+          unencrypted traffic.
 
       A single `reprox` instance can front several services this way —
       just add another `[[routes]]` block:
@@ -87,6 +107,7 @@ use the exact versions you tested against.
       [[routes]]
       sni = "api.domain.com"
       upstream = "127.0.0.1:4443"
+      tls_passthrough = false
       ```
 
       Each `sni` must be unique (checked at startup) and is matched
@@ -280,14 +301,25 @@ curl -I -X OPTIONS https://your-domain.example/        # expect 204 + Allow
 openssl s_client -connect your-domain.example:443 -alpn h2,http/1.1 -servername your-domain.example </dev/null | grep -E "ALPN|subject|issuer"
 ```
 
-The service path (secret SNI) should be transparently forwarded — the
-easiest check is a real client configured with this proxy, or
-eyeballing the TLS record lengths manually:
+The service path for a `tls_passthrough = true` route (the default)
+should be transparently forwarded — the easiest check is a real client
+configured with this proxy, or eyeballing the TLS record lengths
+manually:
 
 ```bash
 openssl s_client -connect your-domain.example:443 -servername www.example-fronting-domain.com </dev/null
 # The handshake should NOT complete with your domain's real certificate —
 # service answers with its own FakeTLS stream, not a genuine TLS ServerHello.
+```
+
+For a `tls_passthrough = false` route, the opposite should be true —
+`reprox`'s own certificate terminates the handshake, and traffic
+reaches `upstream` decrypted:
+
+```bash
+openssl s_client -connect your-domain.example:443 -servername api.domain.example </dev/null | grep -E "subject|issuer"
+# The handshake SHOULD complete with your domain's real certificate this
+# time — unlike the tls_passthrough = true case above.
 ```
 
 Invalid data should not cause an instant RST:
@@ -318,9 +350,10 @@ application-level handling can intercept.
 
 ## Reloading without a restart
 
-Send `SIGHUP` to reload `config.toml`, the `routes` table, the TLS
-certificate/key, the static site, and the per-IP connection/rate
-limits — all without dropping a single in-flight connection:
+Send `SIGHUP` to reload `config.toml`, the `routes` table (including
+each route's `tls_passthrough`), the TLS certificate/key, and the per-IP
+connection/rate limits — all without dropping a single in-flight
+connection:
 
 ```
 sudo systemctl reload reprox     # if your unit sets ExecReload, see below
@@ -329,23 +362,24 @@ kill -HUP $(systemctl show --property MainPID --value reprox)
 ```
 
 A connection already being served keeps running against whatever
-config/routes/site/certificate it had at the moment it was accepted; a
+config/routes/certificate it had at the moment it was accepted; a
 SIGHUP only changes what's used for connections accepted *after* the
 reload completes — there's no window where one connection sees routes
-from one version mixed with a static site from another.
+from one version mixed with a certificate from another.
 
-If a reload fails partway (invalid TOML, a missing/mismatched cert or
-key, an unloadable static site), it's logged and otherwise ignored:
-`reprox` keeps running on whatever configuration it already had, rather
-than crashing or ending up in a half-applied state. Watch the logs after
-sending SIGHUP for either `"reload complete"` or a `"reload failed: ..."`
-line explaining what went wrong.
+If a reload fails partway (invalid TOML, or a missing/mismatched cert
+or key), it's logged and otherwise ignored: `reprox` keeps running on
+whatever configuration it already had, rather than crashing or ending
+up in a half-applied state. Watch the logs after sending SIGHUP for
+either `"reload complete"` or a `"reload failed: ..."` line explaining
+what went wrong.
 
 **What SIGHUP does *not* reload** — `listen_addr`, `metrics_addr`,
-`tls_min_version`, and `max_connections`. Each of these is baked into
-something the process only builds once at startup (a bound listener, the
-`rustls::ServerConfig`'s negotiated TLS version set, a fixed-size
-connection-slot semaphore); changing one of these in `config.toml` and
+`tls_min_version`, `max_connections`, and `static_dir`. Each is baked
+into something the process only builds once at startup (a bound
+listener, the `rustls::ServerConfig`'s negotiated TLS version set, a
+fixed-size connection-slot semaphore, or — for `static_dir` — the
+in-memory static site); changing one of these in `config.toml` and
 sending SIGHUP logs a warning telling you a restart is needed, rather
 than silently doing nothing or half-applying it. `max_connections_per_ip`,
 `connection_rate_per_ip`, and `connection_burst_per_ip` are deliberately
@@ -370,15 +404,25 @@ ExecReload=/bin/kill -HUP $MAINPID
   will end up on the fallback path, where the handshake still
   correctly fails at the rustls level — just as an ordinary TLS
   rejection rather than as "secret proxy".
-- The certificate/key, `routes`, and the static site can be reloaded
-  without a restart by sending `SIGHUP` — see "Reloading without a
-  restart" below. `listen_addr`, `metrics_addr`, `tls_min_version`, and
-  `max_connections` still require a full restart, since each is baked
-  into something only built once at startup (a bound listener, the
-  negotiated TLS version set, a fixed-size semaphore).
+- The certificate/key and `routes` (including each route's
+  `tls_passthrough`) can be reloaded without a restart by sending
+  `SIGHUP` — see "Reloading without a restart" below. `listen_addr`,
+  `metrics_addr`, `tls_min_version`, `max_connections`, and `static_dir`
+  still require a full restart: the first four are baked into something
+  only built once at startup (a bound listener, the negotiated TLS
+  version set, a fixed-size semaphore), and the static site is loaded
+  into memory once and never re-read from disk afterwards.
 - There is no built-in HTTP→HTTPS redirect on port 80 — per the task
   description the service only listens on 443. If you need one, run a
   simple separate redirector on port 80 (or use nginx for that) instead.
+- Every route with `tls_passthrough = false` is terminated using the
+  *same* `TlsAcceptor` as the fallback site, which always advertises
+  ALPN `h2` then `http/1.1`. A client that doesn't send an ALPN
+  extension at all negotiates fine either way, but a client that
+  explicitly offers only some other protocol will fail the handshake
+  against such a route. This is fine for hidden services that speak
+  plain HTTP/1.1 or HTTP/2 once decrypted, but not for ones expecting a
+  custom ALPN token.
 - The optional `max_connections_per_ip` and `connection_rate_per_ip`
   limits (see "Per-IP connection limits") key on the raw TCP peer
   address. Behind a load balancer or CDN that already re-originates
