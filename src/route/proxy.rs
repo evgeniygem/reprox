@@ -266,20 +266,31 @@ pub async fn proxy_with_tls_termination(
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
     let mut tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
-        Ok(Ok(s)) => s,
+        Ok(Ok(s)) => {
+            stats
+                .proxy_tls_handshake_success_total
+                .fetch_add(1, Ordering::Relaxed);
+            s
+        }
         Ok(Err(e)) => {
             // Invalid ClientHello, unsupported TLS version, etc. rustls
             // itself sends a proper TLS alert wherever the protocol calls
             // for one; after the error we just close the connection —
             // with no forced RST (there is no SO_LINGER(0) anywhere in
             // this project).
-            tracing::debug!(error = %e, "proxy TLS handshake failed");
+            stats
+                .proxy_tls_handshake_failure_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!(error = %e, "proxy-path TLS handshake failed");
             return Ok(());
         }
         Err(_) => {
             // Slowloris-style stall: the client never finished the TLS
             // handshake within handshake_timeout_secs.
-            tracing::debug!("proxy TLS handshake timed out");
+            stats
+                .proxy_tls_handshake_failure_total
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("proxy-path TLS handshake timed out");
             return Ok(());
         }
     };

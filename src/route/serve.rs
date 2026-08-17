@@ -44,7 +44,7 @@ pub async fn serve(
     let tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
         Ok(Ok(s)) => {
             stats
-                .tls_handshake_success_total
+                .fallback_tls_handshake_success_total
                 .fetch_add(1, Ordering::Relaxed);
             s
         }
@@ -55,7 +55,7 @@ pub async fn serve(
             // with no forced RST (there is no SO_LINGER(0) anywhere in
             // this project).
             stats
-                .tls_handshake_failure_total
+                .fallback_tls_handshake_failure_total
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!(error = %e, "fallback-path TLS handshake failed");
             return Ok(());
@@ -64,7 +64,7 @@ pub async fn serve(
             // Slowloris-style stall: the client never finished the TLS
             // handshake within handshake_timeout_secs.
             stats
-                .tls_handshake_failure_total
+                .fallback_tls_handshake_failure_total
                 .fetch_add(1, Ordering::Relaxed);
             tracing::debug!("fallback-path TLS handshake timed out");
             return Ok(());
@@ -73,11 +73,15 @@ pub async fn serve(
 
     let alpn = tls_stream.get_ref().1.alpn_protocol().map(|p| p.to_vec());
     if alpn.as_deref() == Some(b"h2") {
-        stats.alpn_h2_total.fetch_add(1, Ordering::Relaxed);
+        stats.fallback_alpn_h2_total.fetch_add(1, Ordering::Relaxed);
     } else if alpn.as_deref() == Some(b"http/1.1") {
-        stats.alpn_http1_total.fetch_add(1, Ordering::Relaxed);
+        stats
+            .fallback_alpn_http1_total
+            .fetch_add(1, Ordering::Relaxed);
     } else {
-        stats.alpn_none_total.fetch_add(1, Ordering::Relaxed);
+        stats
+            .fallback_alpn_none_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     let io = TokioIo::new(tls_stream);

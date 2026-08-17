@@ -113,11 +113,15 @@ pub struct Stats {
     pub proxy_service_connect_retries_total: AtomicU64,
 
     // --- fallback TLS ---
-    pub tls_handshake_success_total: AtomicU64,
-    pub tls_handshake_failure_total: AtomicU64,
-    pub alpn_h2_total: AtomicU64,
-    pub alpn_http1_total: AtomicU64,
-    pub alpn_none_total: AtomicU64,
+    pub fallback_tls_handshake_success_total: AtomicU64,
+    pub fallback_tls_handshake_failure_total: AtomicU64,
+    pub fallback_alpn_h2_total: AtomicU64,
+    pub fallback_alpn_http1_total: AtomicU64,
+    pub fallback_alpn_none_total: AtomicU64,
+
+    // --- proxy TLS ---
+    pub proxy_tls_handshake_success_total: AtomicU64,
+    pub proxy_tls_handshake_failure_total: AtomicU64,
 
     // --- fallback HTTP ---
     pub http_method_get_total: AtomicU64,
@@ -158,11 +162,13 @@ impl Stats {
             proxy_bytes_service_to_client_total: AtomicU64::new(0),
             proxy_service_connect_failures_total: AtomicU64::new(0),
             proxy_service_connect_retries_total: AtomicU64::new(0),
-            tls_handshake_success_total: AtomicU64::new(0),
-            tls_handshake_failure_total: AtomicU64::new(0),
-            alpn_h2_total: AtomicU64::new(0),
-            alpn_http1_total: AtomicU64::new(0),
-            alpn_none_total: AtomicU64::new(0),
+            fallback_tls_handshake_success_total: AtomicU64::new(0),
+            fallback_tls_handshake_failure_total: AtomicU64::new(0),
+            fallback_alpn_h2_total: AtomicU64::new(0),
+            fallback_alpn_http1_total: AtomicU64::new(0),
+            fallback_alpn_none_total: AtomicU64::new(0),
+            proxy_tls_handshake_success_total: AtomicU64::new(0),
+            proxy_tls_handshake_failure_total: AtomicU64::new(0),
             http_method_get_total: AtomicU64::new(0),
             http_method_head_total: AtomicU64::new(0),
             http_method_options_total: AtomicU64::new(0),
@@ -272,11 +278,22 @@ impl Stats {
                     .load(Ordering::Relaxed),
             },
             tls: TlsSnapshot {
-                handshake_success_total: self.tls_handshake_success_total.load(Ordering::Relaxed),
-                handshake_failure_total: self.tls_handshake_failure_total.load(Ordering::Relaxed),
-                alpn_h2_total: self.alpn_h2_total.load(Ordering::Relaxed),
-                alpn_http1_total: self.alpn_http1_total.load(Ordering::Relaxed),
-                alpn_none_total: self.alpn_none_total.load(Ordering::Relaxed),
+                fallback_handshake_success_total: self
+                    .fallback_tls_handshake_success_total
+                    .load(Ordering::Relaxed),
+                fallback_handshake_failure_total: self
+                    .fallback_tls_handshake_failure_total
+                    .load(Ordering::Relaxed),
+                fallback_alpn_h2_total: self.fallback_alpn_h2_total.load(Ordering::Relaxed),
+                fallback_alpn_http1_total: self.fallback_alpn_http1_total.load(Ordering::Relaxed),
+                fallback_alpn_none_total: self.fallback_alpn_none_total.load(Ordering::Relaxed),
+
+                proxy_handshake_success_total: self
+                    .proxy_tls_handshake_success_total
+                    .load(Ordering::Relaxed),
+                proxy_handshake_failure_total: self
+                    .proxy_tls_handshake_failure_total
+                    .load(Ordering::Relaxed),
             },
             http: HttpSnapshot {
                 method_get_total: self.http_method_get_total.load(Ordering::Relaxed),
@@ -479,30 +496,56 @@ impl Stats {
 
         push_metric(
             &mut out,
-            "reprox_tls_handshakes_total",
+            "reprox_fallback_tls_handshakes_total",
             "counter",
             "Fallback-path TLS handshake outcomes.",
             &[
                 (
                     &[("result", "success")],
-                    Value::U(s.tls.handshake_success_total),
+                    Value::U(s.tls.fallback_handshake_success_total),
                 ),
                 (
                     &[("result", "failure")],
-                    Value::U(s.tls.handshake_failure_total),
+                    Value::U(s.tls.fallback_handshake_failure_total),
                 ),
             ],
         );
 
         push_metric(
             &mut out,
-            "reprox_alpn_selected_total",
+            "reprox_fallback_alpn_selected_total",
             "counter",
             "Negotiated ALPN protocol on the fallback path.",
             &[
-                (&[("protocol", "h2")], Value::U(s.tls.alpn_h2_total)),
-                (&[("protocol", "http1")], Value::U(s.tls.alpn_http1_total)),
-                (&[("protocol", "none")], Value::U(s.tls.alpn_none_total)),
+                (
+                    &[("protocol", "h2")],
+                    Value::U(s.tls.fallback_alpn_h2_total),
+                ),
+                (
+                    &[("protocol", "http1")],
+                    Value::U(s.tls.fallback_alpn_http1_total),
+                ),
+                (
+                    &[("protocol", "none")],
+                    Value::U(s.tls.fallback_alpn_none_total),
+                ),
+            ],
+        );
+
+        push_metric(
+            &mut out,
+            "reprox_proxy_tls_handshakes_total",
+            "counter",
+            "Proxy-path TLS handshake outcomes.",
+            &[
+                (
+                    &[("result", "success")],
+                    Value::U(s.tls.proxy_handshake_success_total),
+                ),
+                (
+                    &[("result", "failure")],
+                    Value::U(s.tls.proxy_handshake_failure_total),
+                ),
             ],
         );
 
@@ -661,11 +704,13 @@ struct ProxySnapshot {
 
 #[derive(Serialize)]
 struct TlsSnapshot {
-    handshake_success_total: u64,
-    handshake_failure_total: u64,
-    alpn_h2_total: u64,
-    alpn_http1_total: u64,
-    alpn_none_total: u64,
+    fallback_handshake_success_total: u64,
+    fallback_handshake_failure_total: u64,
+    fallback_alpn_h2_total: u64,
+    fallback_alpn_http1_total: u64,
+    fallback_alpn_none_total: u64,
+    proxy_handshake_success_total: u64,
+    proxy_handshake_failure_total: u64,
 }
 
 #[derive(Serialize)]
