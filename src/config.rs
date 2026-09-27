@@ -38,6 +38,14 @@ pub struct ServiceConfig {
     #[serde(default = "default_server_header")]
     pub server_header: String,
 
+    /// Timeout (seconds) for completing the initial TLS accept step —
+    /// reading and parsing the ClientHello via `LazyConfigAcceptor`, before
+    /// a target route (or lack thereof) is even known. Guards against
+    /// slowloris-style connections that open a socket and never send a
+    /// complete ClientHello.
+    #[serde(default = "default_start_handshake_timeout")]
+    pub start_handshake_timeout_secs: u64,
+
     /// Timeout (seconds) for reading/parsing the ClientHello and for the
     /// entire TLS handshake on the fallback path. Guards against
     /// slowloris-style connections that never complete.
@@ -100,6 +108,14 @@ pub struct ProxyTarget {
     /// directly to `TcpStream::connect`.
     pub upstream: String,
 
+    /// ALPN protocols to advertise when this route terminates TLS itself
+    /// (`tls_passthrough = false`), in preference order (e.g. `["h2", "http/1.1"]`).
+    /// Ignored when `tls_passthrough = true`, since bytes are relayed to
+    /// `upstream` untouched and ALPN is negotiated there instead. When
+    /// omitted, `reprox` falls back to its default `h2`/`http/1.1` list.
+    #[serde(default, with = "deserialize_string_as_bytes")]
+    pub alpn_protocols: Option<Vec<Vec<u8>>>,
+
     /// Whether this route's traffic bypasses TLS entirely on this side.
     ///
     /// `true` (the default): classic FakeTLS behavior — the raw TCP stream
@@ -122,6 +138,13 @@ pub struct ProxyTarget {
 /// site doesn't visibly announce it's actually `reprox`.
 fn default_server_header() -> String {
     "nginx/1.26.2 (Ubuntu)".to_string()
+}
+
+/// Default for `start_handshake_timeout_secs`. 10s mirrors the
+/// fallback-path handshake timeout and comfortably covers real
+/// clients while still bounding stalled connections.
+fn default_start_handshake_timeout() -> u64 {
+    10
 }
 
 /// Default timeout, in seconds, for both the SNI probe and the
@@ -153,6 +176,18 @@ fn default_max_connections() -> usize {
 /// keep working unchanged.
 fn default_tls_passthrough() -> bool {
     true
+}
+
+mod deserialize_string_as_bytes {
+    use serde::{Deserialize, Deserializer};
+
+    pub fn deserialize<'a, D>(deserializer: D) -> Result<Option<Vec<Vec<u8>>>, D::Error>
+    where
+        D: Deserializer<'a>,
+    {
+        let opt_strings: Option<Vec<String>> = Option::deserialize(deserializer)?;
+        Ok(opt_strings.map(|vec| vec.into_iter().map(|s| s.into_bytes()).collect()))
+    }
 }
 
 impl ServiceConfig {

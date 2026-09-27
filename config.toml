@@ -87,6 +87,7 @@ max_connections = 10000
 [[routes]]
 sni = "domain.com"
 upstream = "127.0.0.1:8080"
+alpn_protocols = ["http/1.1"]
 
 # TLS termination: reprox decrypts for api.domain.com and hands
 # 127.0.0.1:4443 plain, unencrypted traffic.
