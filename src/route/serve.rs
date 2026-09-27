@@ -16,37 +16,38 @@ use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 
-use tokio::net::TcpStream;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::StartHandshake;
 
 use super::fallback::{FileEntry, StaticSite};
 use crate::config::ServiceConfig;
 use crate::http_util::{ResponseBody, empty_body, full_body};
 use crate::metrics::Stats;
-use crate::prefixed_stream::PrefixedStream;
+use rustls::ServerConfig;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::timeout;
 
 // TLS termination + choosing HTTP/1.1 or HTTP/2 based on the ALPN result
-pub async fn serve(
-    stream: TcpStream,
-    prefix: Bytes,
-    acceptor: TlsAcceptor,
+pub async fn serve<Io>(
+    acceptor: StartHandshake<Io>,
+    server_config: Arc<ServerConfig>,
     site: Arc<StaticSite>,
     config: Arc<ServiceConfig>,
     stats: Arc<Stats>,
-) -> anyhow::Result<()> {
-    let io = PrefixedStream::new(prefix, stream);
+) -> anyhow::Result<()>
+where
+    Io: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
-    let tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
-        Ok(Ok(s)) => {
+    let tls_stream = match timeout(handshake_timeout, acceptor.into_stream(server_config)).await {
+        Ok(Ok(io)) => {
             stats
                 .fallback_tls_handshake_success_total
                 .fetch_add(1, Ordering::Relaxed);
-            s
+            io
         }
         Ok(Err(e)) => {
             // Invalid ClientHello, unsupported TLS version, etc. rustls

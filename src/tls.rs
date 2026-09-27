@@ -68,12 +68,18 @@ impl ResolvesServerCert for ReloadableCertResolver {
     }
 }
 
-pub async fn build_server_config(
+pub async fn build_cert_resolver(
     config: &ServiceConfig,
-) -> anyhow::Result<(ServerConfig, Arc<ReloadableCertResolver>)> {
+) -> anyhow::Result<Arc<ReloadableCertResolver>> {
     let certified_key = load_certified_key(&config.tls_cert_path, &config.tls_key_path).await?;
-    let resolver = Arc::new(ReloadableCertResolver::new(certified_key));
+    Ok(Arc::new(ReloadableCertResolver::new(certified_key)))
+}
 
+pub fn build_server_config(
+    resolver: Arc<ReloadableCertResolver>,
+    alpn_protocols: Vec<Vec<u8>>,
+    config: &ServiceConfig,
+) -> anyhow::Result<Arc<ServerConfig>> {
     let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
 
     let versions: &[&'static rustls::SupportedProtocolVersion] = if config.tls_min_version == "1.3"
@@ -87,13 +93,11 @@ pub async fn build_server_config(
         .with_protocol_versions(versions)
         .context("failed to configure the requested TLS versions")?
         .with_no_client_auth()
-        .with_cert_resolver(resolver.clone());
+        .with_cert_resolver(resolver);
 
-    // ALPN: HTTP/2 first, then HTTP/1.1 — like a real modern web server
-    // with http2 enabled.
-    server_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    server_config.alpn_protocols = alpn_protocols;
 
-    Ok((server_config, resolver))
+    Ok(Arc::new(server_config))
 }
 
 /// Loads the certificate/key at `cert_path`/`key_path` and packages

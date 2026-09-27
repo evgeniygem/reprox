@@ -300,6 +300,16 @@ impl ServiceConfig {
             // client's traffic happens to hit this route.
             validate_upstream(&target.upstream)
                 .with_context(|| format!("invalid upstream for sni {:?}", target.sni))?;
+
+            // Reject malformed or oversized ALPN lists at config-load time,
+            // rather than failing per-connection once TLS termination is
+            // attempted for this route.
+            validate_alpn_protocols(&target.alpn_protocols)
+                .with_context(|| format!("invalid alpn protocols for sni {:?}", target.sni))?;
+        }
+
+        if self.start_handshake_timeout_secs == 0 {
+            anyhow::bail!("start_handshake_timeout_secs must be greater than 0");
         }
         if self.handshake_timeout_secs == 0 {
             anyhow::bail!("handshake_timeout_secs must be greater than 0");
@@ -442,6 +452,62 @@ fn validate_upstream(upstream: &str) -> anyhow::Result<()> {
         Ok(_) => Ok(()),
         Err(_) => anyhow::bail!("{port:?} is not a valid port number"),
     }
+}
+
+/// Validates a route's `alpn_protocols` against the constraints the
+/// TLS ALPN extension itself imposes: each name must be non-empty and
+/// ≤255 bytes (the wire format's 1-byte length prefix), names must be
+/// unique, and the total encoded list must fit the extension's 2-byte
+/// length field. `None` is always valid — `reprox` then uses its
+/// default `h2`/`http/1.1` list.
+fn validate_alpn_protocols(alpn_protocols: &Option<Vec<Vec<u8>>>) -> anyhow::Result<()> {
+    /// Maximum length of a single protocol name (encoded with a 1-byte length prefix).
+    const MAX_PROTOCOL_LEN: usize = 255;
+
+    /// Maximum total length of the protocol list (encoded in a 2-byte field).
+    const MAX_LIST_LEN: usize = u16::MAX as usize;
+
+    let Some(protocols) = alpn_protocols else {
+        // No ALPN list at all is a valid state.
+        return Ok(());
+    };
+
+    anyhow::ensure!(
+        !protocols.is_empty(),
+        "ALPN protocol list must not be empty"
+    );
+
+    let mut seen = std::collections::HashSet::with_capacity(protocols.len());
+    let mut total_len: usize = 0;
+
+    for (i, proto) in protocols.iter().enumerate() {
+        anyhow::ensure!(
+            !proto.is_empty(),
+            "ALPN protocol #{i} is empty: protocol name must be 1..={MAX_PROTOCOL_LEN} bytes long"
+        );
+        anyhow::ensure!(
+            proto.len() <= MAX_PROTOCOL_LEN,
+            "ALPN protocol #{i} is too long ({} bytes), max is {MAX_PROTOCOL_LEN}",
+            proto.len()
+        );
+
+        if !seen.insert(proto.as_slice()) {
+            anyhow::bail!(
+                "ALPN protocol #{i} ({:?}) is duplicated in the list",
+                String::from_utf8_lossy(proto)
+            );
+        }
+
+        // 1 length byte + the protocol name itself
+        total_len += 1 + proto.len();
+    }
+
+    anyhow::ensure!(
+        total_len <= MAX_LIST_LEN,
+        "total encoded ALPN list length {total_len} bytes exceeds the limit of {MAX_LIST_LEN}"
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

@@ -3,17 +3,14 @@ mod http_util;
 mod ip_limiter;
 mod limiter;
 mod metrics;
-mod prefixed_stream;
 mod rate_limiter;
 mod route;
-mod sni;
 mod tls;
 
 use anyhow::Context;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio_rustls::TlsAcceptor;
 
 use crate::config::ServiceConfig;
 use crate::ip_limiter::IpLimiter;
@@ -58,8 +55,7 @@ async fn main() -> anyhow::Result<()> {
         "configuration loaded"
     );
 
-    let (server_config, cert_resolver) = tls::build_server_config(&config).await?;
-    let acceptor = TlsAcceptor::from(Arc::new(server_config));
+    let cert_resolver = tls::build_cert_resolver(&config).await?;
 
     let site = Arc::new(StaticSite::try_load(&config.static_dir).await?);
     let stats = Arc::new(Stats::new());
@@ -82,7 +78,7 @@ async fn main() -> anyhow::Result<()> {
     // accept_loop, and the listener) are dropped below, and so
     // accept_loop can gate admission on the connection-slot semaphore
     // that also lives on `Stats` (see metrics::Stats::acquire_connection_slot).
-    let router = Router::new(acceptor, stats.clone(), site, config.clone());
+    let router = Router::new(cert_resolver.clone(), stats.clone(), site, config.clone());
     let rate_limiter = RateLimiter::new(
         config.connection_rate_per_ip.unwrap_or(0.0),
         config.connection_burst_per_ip.unwrap_or(10),

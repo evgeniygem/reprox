@@ -97,14 +97,12 @@ pub struct Stats {
     fallback_connection_duration_ms_total: AtomicU64,
     pub connections_probe_timeout_total: AtomicU64,
     pub connections_probe_io_error_total: AtomicU64,
-    pub connections_closed_early_total: AtomicU64,
     active_proxied: AtomicI64,
     active_fallback: AtomicI64,
 
     // --- ClientHello classification (see sni::ProbeResult) ---
     pub sni_present_total: AtomicU64,
     pub sni_absent_total: AtomicU64,
-    pub clienthello_not_tls_total: AtomicU64,
 
     // --- service proxy path ---
     pub proxy_bytes_client_to_service_total: AtomicU64,
@@ -152,12 +150,10 @@ impl Stats {
             fallback_connection_duration_ms_total: AtomicU64::new(0),
             connections_probe_timeout_total: AtomicU64::new(0),
             connections_probe_io_error_total: AtomicU64::new(0),
-            connections_closed_early_total: AtomicU64::new(0),
             active_proxied: AtomicI64::new(0),
             active_fallback: AtomicI64::new(0),
             sni_present_total: AtomicU64::new(0),
             sni_absent_total: AtomicU64::new(0),
-            clienthello_not_tls_total: AtomicU64::new(0),
             proxy_bytes_client_to_service_total: AtomicU64::new(0),
             proxy_bytes_service_to_client_total: AtomicU64::new(0),
             proxy_service_connect_failures_total: AtomicU64::new(0),
@@ -247,7 +243,6 @@ impl Stats {
                 probe_io_error_total: self
                     .connections_probe_io_error_total
                     .load(Ordering::Relaxed),
-                closed_early_total: self.connections_closed_early_total.load(Ordering::Relaxed),
                 connections_limit: config.max_connections as u64,
                 connections_available: (config.max_connections as u64)
                     .saturating_sub(self.connections.load(Ordering::Relaxed)),
@@ -261,7 +256,6 @@ impl Stats {
             clienthello: ClientHelloSnapshot {
                 sni_present_total: self.sni_present_total.load(Ordering::Relaxed),
                 sni_absent_total: self.sni_absent_total.load(Ordering::Relaxed),
-                not_tls_total: self.clienthello_not_tls_total.load(Ordering::Relaxed),
             },
             proxy: ProxySnapshot {
                 bytes_client_to_service_total: self
@@ -410,10 +404,6 @@ impl Stats {
                     Value::U(s.connections.probe_io_error_total),
                 ),
                 (
-                    &[("reason", "closed_early")],
-                    Value::U(s.connections.closed_early_total),
-                ),
-                (
                     &[("reason", "ip_limit")],
                     Value::U(s.connections.ip_limit_total),
                 ),
@@ -453,10 +443,6 @@ impl Stats {
                 (
                     &[("result", "sni_absent")],
                     Value::U(s.clienthello.sni_absent_total),
-                ),
-                (
-                    &[("result", "not_tls")],
-                    Value::U(s.clienthello.not_tls_total),
                 ),
             ],
         );
@@ -680,7 +666,6 @@ struct ConnectionsSnapshot {
     fallback_duration_ms_sum: u64,
     probe_timeout_total: u64,
     probe_io_error_total: u64,
-    closed_early_total: u64,
     connections_limit: u64,
     connections_available: u64,
     ip_limit_total: u64,
@@ -691,7 +676,6 @@ struct ConnectionsSnapshot {
 struct ClientHelloSnapshot {
     sni_present_total: u64,
     sni_absent_total: u64,
-    not_tls_total: u64,
 }
 
 #[derive(Serialize)]

@@ -37,13 +37,12 @@ use std::time::Duration;
 
 use crate::config::ServiceConfig;
 use crate::metrics::Stats;
-use crate::prefixed_stream::PrefixedStream;
 use anyhow::Context;
-use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use rustls::ServerConfig;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tokio_rustls::TlsAcceptor;
+use tokio_rustls::StartHandshake;
 
 /// How `connect_with_backoff` retries a failed or stalled connect to the
 /// upstream service.
@@ -177,12 +176,11 @@ async fn connect_with_backoff(
 
 async fn relay_to_service<S>(
     stream: &mut S,
-    prefix: Option<Bytes>,
     endpoint: &str,
     stats: Arc<Stats>,
 ) -> anyhow::Result<()>
 where
-    S: AsyncWrite + AsyncRead + Unpin,
+    S: AsyncWrite + AsyncRead + Unpin + Send,
 {
     let mut upstream =
         match connect_with_backoff(endpoint, &ConnectRetryPolicy::DEFAULT, &stats).await {
@@ -200,18 +198,6 @@ where
             }
         };
     let _ = upstream.set_nodelay(true);
-
-    if let Some(prefix) = prefix.as_ref()
-        && !prefix.is_empty()
-    {
-        upstream
-            .write_all(prefix)
-            .await
-            .context("failed to forward the buffered ClientHello to service")?;
-        stats
-            .proxy_bytes_client_to_service_total
-            .fetch_add(prefix.len() as u64, Ordering::Relaxed);
-    }
 
     match tokio::io::copy_bidirectional(stream, &mut upstream).await {
         Ok((from_client, from_upstream)) => {
@@ -233,13 +219,11 @@ where
     Ok(())
 }
 
-pub async fn proxy(
-    mut client: TcpStream,
-    prefix: Bytes,
-    endpoint: &str,
-    stats: Arc<Stats>,
-) -> anyhow::Result<()> {
-    relay_to_service(&mut client, Some(prefix), endpoint, stats).await
+pub async fn proxy<S>(mut stream: S, endpoint: &str, stats: Arc<Stats>) -> anyhow::Result<()>
+where
+    S: AsyncWrite + AsyncRead + Unpin + Send,
+{
+    relay_to_service(&mut stream, endpoint, stats).await
 }
 
 /// Like `proxy`, but for a route with `tls_passthrough = false`: instead of
@@ -254,18 +238,20 @@ pub async fn proxy(
 /// lost. The handshake itself, ALPN bookkeeping, and connect-with-backoff
 /// to `endpoint` all mirror `serve`/`proxy` respectively — see those for
 /// the reasoning behind each step.
-pub async fn proxy_with_tls_termination(
-    stream: TcpStream,
-    prefix: Bytes,
-    acceptor: TlsAcceptor,
+pub async fn proxy_with_tls_termination<Io>(
+    acceptor: StartHandshake<Io>,
+    server_config: Arc<ServerConfig>,
     endpoint: &str,
     config: Arc<ServiceConfig>,
     stats: Arc<Stats>,
-) -> anyhow::Result<()> {
-    let io = PrefixedStream::new(prefix, stream);
+) -> anyhow::Result<()>
+where
+    Io: AsyncRead + AsyncWrite + Unpin + Send,
+{
     let handshake_timeout = Duration::from_secs(config.handshake_timeout_secs);
 
-    let mut tls_stream = match timeout(handshake_timeout, acceptor.accept(io)).await {
+    let mut tls_stream = match timeout(handshake_timeout, acceptor.into_stream(server_config)).await
+    {
         Ok(Ok(s)) => {
             stats
                 .proxy_tls_handshake_success_total
@@ -295,7 +281,7 @@ pub async fn proxy_with_tls_termination(
         }
     };
 
-    relay_to_service(&mut tls_stream, None, endpoint, stats).await
+    relay_to_service(&mut tls_stream, endpoint, stats).await
 }
 
 #[cfg(test)]
