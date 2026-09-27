@@ -7,6 +7,39 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/) (pre-1.0,
 so minor bumps may contain breaking changes).
 
+## [v0.8.0] - 2026-09-28
+
+### Added
+
+- Per-route `alpn_protocols` config option to override the ALPN list `reprox`
+  advertises when terminating TLS itself (`tls_passthrough = false`); defaults
+  to the existing `h2`, `http/1.1` list when omitted. Validated at
+  config-load time (non-empty, ≤255-byte names, no duplicates, total encoded
+  list ≤65535 bytes).
+- `start_handshake_timeout_secs` config option (default `10`) bounding how
+  long `reprox` waits to read and parse a connection's ClientHello, separate
+  from the fallback-path `handshake_timeout_secs`.
+
+### Changed
+
+- Replaced the hand-rolled ClientHello/SNI probing with rustls's
+  `LazyConfigAcceptor`/`StartHandshake`, so the ClientHello is parsed once by
+  rustls itself. The TLS-termination `ServerConfig` (including per-route
+  ALPN) is now built after the SNI lookup instead of being fixed for the
+  whole listener at startup.
+- `tls::build_server_config` split into `build_cert_resolver` (loads the
+  cert/key once at startup) and `build_server_config` (builds a
+  `ServerConfig` from a resolver + ALPN list), enabling a distinct
+  `ServerConfig` per matching route.
+
+### Removed
+
+- The `not_tls` / `closed_early` connection-classification metrics
+  (`clienthello_not_tls_total`, `connections_closed_early_total`); these
+  outcomes are no longer distinguished by the new acceptor and now fall
+  under `connections_probe_io_error_total`. Update any dashboards/alerts
+  referencing them.
+
 ## [v0.7.0] - 2026-08-17
 
 ### Added
